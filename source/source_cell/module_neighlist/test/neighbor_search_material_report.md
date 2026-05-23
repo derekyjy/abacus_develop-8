@@ -181,7 +181,7 @@ const auto finish = std::chrono::steady_clock::now();
 并输出：
 
 ```text
-[sltk] ... avg_neighbors=... build_ms=...
+[sltk] ... avg_neighbors=... build_ms=... memory_mb=...
 ```
 
 ### 4.3 独立 runner 编写思路
@@ -207,6 +207,7 @@ grid_d.Find_atom(*ucell, type, atom, &adjs);
 - 有近邻的原子数 `atoms_with_neighbors`
 - 平均近邻数 `average_neighbors`
 - 网格构建耗时 `build_ms`
+- 近邻搜索数据结构估算内存 `memory_mb`
 
 如果出现原子数不对、近邻覆盖不足、自身原子不在末尾等情况，runner 会抛出异常并终止。
 
@@ -288,22 +289,24 @@ AdjacentAtomInfo
 独立 SLTK runner 输出如下：
 
 ```text
-[sltk] Al fcc / 1000 atoms / PW / metal: atoms=1000, avg_neighbors=12, build_ms=142.109
-[sltk] Si diamond / 2000 atoms / LCAO / semiconductor: atoms=2000, avg_neighbors=4, build_ms=582.259
-[sltk] NaCl / 3000 atoms / PW / ionic crystal: atoms=3000, avg_neighbors=6, build_ms=1333.58
-[sltk] TiO2 rutile / 4200 atoms / LCAO / complex oxide: atoms=4200, avg_neighbors=4, build_ms=2567.95
+[sltk] Al fcc / 1000 atoms / PW / metal: atoms=1000, avg_neighbors=12, build_ms=140.929, memory_mb=1.41178
+[sltk] Si diamond / 2000 atoms / LCAO / semiconductor: atoms=2000, avg_neighbors=4, build_ms=573.257, memory_mb=2.63926
+[sltk] NaCl / 3000 atoms / PW / ionic crystal: atoms=3000, avg_neighbors=6, build_ms=1343.78, memory_mb=5.31549
+[sltk] TiO2 rutile / 4200 atoms / LCAO / complex oxide: atoms=4200, avg_neighbors=4, build_ms=2554.68, memory_mb=10.3932
 ```
 
 整理为表格：
 
-| 体系 | 原子数 | 平均近邻数 | 网格构建时间 ms | 结果 |
-| --- | ---: | ---: | ---: | --- |
-| Al fcc | 1,000 | 12.0 | 142.109 | 通过 |
-| Si diamond | 2,000 | 4.0 | 582.259 | 通过 |
-| NaCl | 3,000 | 6.0 | 1333.58 | 通过 |
-| TiO2 rutile | 4,200 | 4.0 | 2567.95 | 通过 |
+| 体系 | 原子数 | 平均近邻数 | 网格构建时间 ms | 内存 MB | 结果 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Al fcc | 1,000 | 12.0 | 140.929 | 1.41178 | 通过 |
+| Si diamond | 2,000 | 4.0 | 573.257 | 2.63926 | 通过 |
+| NaCl | 3,000 | 6.0 | 1343.78 | 5.31549 | 通过 |
+| TiO2 rutile | 4,200 | 4.0 | 2554.68 | 10.3932 | 通过 |
 
-其中 `build_ms` 只统计 `Grid_Driver::init()`，即旧 SLTK 网格和近邻数据结构的构建时间。平均近邻数只作为结果统计输出，不再作为强制通过条件。
+其中 `build_ms` 只统计 `Grid_Driver::init()`，即旧 SLTK 网格和近邻数据结构的构建时间。`memory_mb` 统计的是 `Grid_Driver::init()` 后近邻搜索核心数据结构的估算内存，主要包括 `atoms_in_box` 中保存的扩胞候选原子，以及 `all_adj_info` 中保存的邻接指针列表。平均近邻数只作为结果统计输出，不再作为强制通过条件。
+
+如果后续与 MPI 并行实现对比，建议采用同一统计口径：每个 rank 分别统计本 rank 的近邻搜索数据结构内存，然后在报告中给出 `max_rank_memory_mb` 和 `sum_rank_memory_mb`。`max_rank_memory_mb` 反映单个进程的峰值压力，`sum_rank_memory_mb` 反映整个并行作业的总内存消耗。
 
 从结果可以看到，随着原子数增加，旧 SLTK 算法构造近邻表耗时明显上升。其原因是旧算法虽然有 `atoms_in_box` 的数据结构，但实际构造近邻时仍然会在扩胞候选范围内做较大范围的遍历和距离判断。
 

@@ -180,6 +180,36 @@ std::unique_ptr<UnitCell> make_crystal_case(const MaterialCase& material)
     return ucell;
 }
 
+double estimate_grid_memory_mb(const Grid_Driver& grid)
+{
+    size_t bytes = sizeof(Grid_Driver);
+    bytes += grid.atoms_in_box.capacity() * sizeof(std::vector<std::vector<AtomMap>>);
+    for (const auto& boxes_yz : grid.atoms_in_box)
+    {
+        bytes += boxes_yz.capacity() * sizeof(std::vector<AtomMap>);
+        for (const auto& boxes_z : boxes_yz)
+        {
+            bytes += boxes_z.capacity() * sizeof(AtomMap);
+            for (const auto& atoms : boxes_z)
+            {
+                bytes += atoms.capacity() * sizeof(FAtom);
+            }
+        }
+    }
+
+    bytes += grid.all_adj_info.capacity() * sizeof(std::vector<std::vector<FAtom*>>);
+    for (const auto& atoms_by_type : grid.all_adj_info)
+    {
+        bytes += atoms_by_type.capacity() * sizeof(std::vector<FAtom*>);
+        for (const auto& adjacent_atoms : atoms_by_type)
+        {
+            bytes += adjacent_atoms.capacity() * sizeof(FAtom*);
+        }
+    }
+
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
 void run_case(const MaterialCase& material, std::ofstream& ofs)
 {
     std::unique_ptr<UnitCell> ucell = make_crystal_case(material);
@@ -193,6 +223,7 @@ void run_case(const MaterialCase& material, std::ofstream& ofs)
     grid_d.init(ofs, *ucell, material.cutoff, true);
     const auto build_finish = std::chrono::steady_clock::now();
     const double build_ms = std::chrono::duration<double, std::milli>(build_finish - build_start).count();
+    const double grid_memory_mb = estimate_grid_memory_mb(grid_d);
 
     long long total_neighbors = 0;
     int atoms_with_neighbors = 0;
@@ -226,6 +257,7 @@ void run_case(const MaterialCase& material, std::ofstream& ofs)
     const double average_neighbors = static_cast<double>(total_neighbors) / material.expected_atoms;
     std::cout << "[sltk] " << material.name << ": atoms=" << material.expected_atoms
               << ", avg_neighbors=" << average_neighbors << ", build_ms=" << build_ms
+              << ", memory_mb=" << grid_memory_mb
               << ", traverse_ms=" << traverse_ms << ", total_ms=" << total_ms << std::endl;
 }
 } // namespace
