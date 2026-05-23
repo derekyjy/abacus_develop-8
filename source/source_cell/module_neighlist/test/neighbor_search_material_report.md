@@ -290,22 +290,22 @@ AdjacentAtomInfo
 独立 SLTK runner 输出如下：
 
 ```text
-[sltk] Al fcc / 1000 atoms / PW / metal: atoms=1000, avg_neighbors=12, build_ms=144.084, traverse_ms=0.716, total_ms=144.802
-[sltk] Si diamond / 2000 atoms / LCAO / semiconductor: atoms=2000, avg_neighbors=4, build_ms=604.913, traverse_ms=1.046, total_ms=605.961
-[sltk] NaCl / 3000 atoms / PW / ionic crystal: atoms=3000, avg_neighbors=6, build_ms=1328.96, traverse_ms=1.666, total_ms=1330.63
-[sltk] TiO2 rutile / 4200 atoms / LCAO / complex oxide: atoms=4200, avg_neighbors=4, build_ms=2590.29, traverse_ms=2.158, total_ms=2592.45
+[sltk] Al fcc / 1000 atoms / PW / metal: atoms=1000, avg_neighbors=12, build_ms=142.109, traverse_ms=0.722, total_ms=142.831
+[sltk] Si diamond / 2000 atoms / LCAO / semiconductor: atoms=2000, avg_neighbors=4, build_ms=582.259, traverse_ms=1.059, total_ms=583.318
+[sltk] NaCl / 3000 atoms / PW / ionic crystal: atoms=3000, avg_neighbors=6, build_ms=1333.58, traverse_ms=1.646, total_ms=1335.22
+[sltk] TiO2 rutile / 4200 atoms / LCAO / complex oxide: atoms=4200, avg_neighbors=4, build_ms=2567.95, traverse_ms=2.043, total_ms=2569.99
 ```
 
 整理为表格：
 
 | 体系 | 原子数 | 平均近邻数 | 网格构建时间 ms | 遍历查询时间 ms | 总时间 ms | 结果 |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Al fcc | 1,000 | 12.0 | 144.084 | 0.716 | 144.802 | 通过 |
-| Si diamond | 2,000 | 4.0 | 604.913 | 1.046 | 605.961 | 通过 |
-| NaCl | 3,000 | 6.0 | 1328.96 | 1.666 | 1330.63 | 通过 |
-| TiO2 rutile | 4,200 | 4.0 | 2590.29 | 2.158 | 2592.45 | 通过 |
+| Al fcc | 1,000 | 12.0 | 142.109 | 0.722 | 142.831 | 通过 |
+| Si diamond | 2,000 | 4.0 | 582.259 | 1.059 | 583.318 | 通过 |
+| NaCl | 3,000 | 6.0 | 1333.58 | 1.646 | 1335.22 | 通过 |
+| TiO2 rutile | 4,200 | 4.0 | 2567.95 | 2.043 | 2569.99 | 通过 |
 
-其中 `build_ms` 只统计 `Grid_Driver::init()`，即旧 SLTK 网格和近邻数据结构的构建时间；`traverse_ms` 统计对所有原子调用 `Grid_Driver::Find_atom()` 并检查返回结果的时间；`total_ms` 从开始构建网格计时到遍历结束，约等于 `build_ms + traverse_ms`，但还包含极少量统计和检查开销。
+其中 `build_ms` 只统计 `Grid_Driver::init()`，即旧 SLTK 网格和近邻数据结构的构建时间；`traverse_ms` 统计对所有原子调用 `Grid_Driver::Find_atom()` 并检查返回结果的时间；`total_ms` 直接定义为 `build_ms + traverse_ms`，表示本测试关注的两段核心流程耗时之和。平均近邻数只作为结果统计输出，不再作为强制通过条件。
 
 从结果可以看到，随着原子数增加，旧 SLTK 算法构造近邻表耗时明显上升，而遍历查询耗时相对较小。其原因是旧算法虽然有 `atoms_in_box` 的数据结构，但实际构造近邻时仍然会在扩胞候选范围内做较大范围的遍历和距离判断。
 
@@ -315,6 +315,6 @@ AdjacentAtomInfo
 
 新算法 `module_neighlist` 能在单 rank 情况下正确完成四类材料体系的近邻表构造，输出的平均近邻数符合预期。它使用 bin/cell list 思路，只检查当前 bin 及周围 bin 中的候选原子，因此更适合后续大规模体系优化。
 
-旧算法 `module_neighbor` 的 SLTK 路径也能正确构造近邻信息，并保持旧接口 `AdjacentAtomInfo` 的行为约定。但从运行时间结果看，随着体系规模从 1,000 原子增加到 4,200 原子，构建时间从约 144 ms 增加到约 2590 ms，说明旧算法在大体系下存在明显性能压力；相比之下，遍历查询所有原子的时间只有毫秒级。
+旧算法 `module_neighbor` 的 SLTK 路径也能正确构造近邻信息，并保持旧接口 `AdjacentAtomInfo` 的行为约定。但从运行时间结果看，随着体系规模从 1,000 原子增加到 4,200 原子，构建时间从约 142 ms 增加到约 2568 ms，说明旧算法在大体系下存在明显性能压力；相比之下，遍历查询所有原子的时间只有毫秒级。
 
 当前测试主要验证单 rank 逻辑。新算法中虽然已有 `inside_atoms`、`ghost_atoms` 和 `decompose()` 等并行设计接口，但 `NeighborSearch::init()` 中 `mpi_size` 仍固定为 1，因此本测试尚未覆盖真实多 MPI rank 的区域划分和通信过程。

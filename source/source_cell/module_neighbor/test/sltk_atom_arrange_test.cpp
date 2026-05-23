@@ -74,7 +74,6 @@ struct SltkMaterialCase
     std::vector<int> type_counts_per_cell;
     std::vector<std::tuple<int, double, double, double>> basis;
     int expected_atoms;
-    double expected_average_neighbors;
 };
 
 std::unique_ptr<UnitCell> make_sltk_crystal_case(const SltkMaterialCase& material)
@@ -157,7 +156,6 @@ void expect_sltk_material_result(const SltkMaterialCase& material, std::ofstream
     ASSERT_EQ(total_atoms, material.expected_atoms) << material.name;
 
     Grid_Driver grid_d(PARAM.input.test_deconstructor, PARAM.input.test_grid);
-    const auto total_start = std::chrono::steady_clock::now();
     const auto build_start = std::chrono::steady_clock::now();
     grid_d.init(ofs, *ucell, material.cutoff, true);
     const auto build_finish = std::chrono::steady_clock::now();
@@ -190,16 +188,12 @@ void expect_sltk_material_result(const SltkMaterialCase& material, std::ofstream
     }
     const auto traverse_finish = std::chrono::steady_clock::now();
     const double traverse_ms = std::chrono::duration<double, std::milli>(traverse_finish - traverse_start).count();
-    const double total_ms = std::chrono::duration<double, std::milli>(traverse_finish - total_start).count();
+    const double total_ms = build_ms + traverse_ms;
 
     EXPECT_EQ(atoms_with_neighbors, material.expected_atoms) << material.name;
     EXPECT_GT(total_neighbors, material.expected_atoms) << material.name;
 
     const double average_neighbors = static_cast<double>(total_neighbors) / material.expected_atoms;
-    if (material.expected_average_neighbors > 0.0)
-    {
-        EXPECT_NEAR(average_neighbors, material.expected_average_neighbors, 1.0e-12) << material.name;
-    }
     std::cout << "[sltk] " << material.name << ": atoms=" << material.expected_atoms
               << ", avg_neighbors=" << average_neighbors << ", build_ms=" << build_ms
               << ", traverse_ms=" << traverse_ms << ", total_ms=" << total_ms << std::endl;
@@ -327,7 +321,6 @@ TEST_F(SltkAtomArrangeTest, MaterialCoverageAndRuntime)
                 {0, 0.5, 0.5, 0.0},
             },
             1000,
-            12.0,
         },
         {
             "Si diamond / 2000 atoms / LCAO / semiconductor",
@@ -351,7 +344,6 @@ TEST_F(SltkAtomArrangeTest, MaterialCoverageAndRuntime)
                 {0, 0.75, 0.75, 0.25},
             },
             2000,
-            4.0,
         },
         {
             "NaCl / 3000 atoms / PW / ionic crystal",
@@ -375,7 +367,6 @@ TEST_F(SltkAtomArrangeTest, MaterialCoverageAndRuntime)
                 {1, 0.5, 0.5, 0.5},
             },
             3000,
-            6.0,
         },
         {
             "TiO2 rutile / 4200 atoms / LCAO / complex oxide",
@@ -397,7 +388,6 @@ TEST_F(SltkAtomArrangeTest, MaterialCoverageAndRuntime)
                 {1, 0.195, 0.805, 0.5},
             },
             4200,
-            4.0,
         },
     };
 

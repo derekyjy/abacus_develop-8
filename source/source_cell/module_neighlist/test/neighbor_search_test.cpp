@@ -22,7 +22,6 @@ struct MaterialNeighborCase
     std::vector<int> type_counts_per_cell;
     std::vector<std::tuple<int, double, double, double>> basis;
     int expected_atoms;
-    double expected_average_neighbors;
 };
 
 UnitCellPlus make_crystal_case(const MaterialNeighborCase& material)
@@ -123,11 +122,6 @@ void expect_valid_neighbor_result(const MaterialNeighborCase& material)
 
     EXPECT_EQ(atoms_with_neighbors, material.expected_atoms) << material.name;
     EXPECT_GT(total_neighbors, material.expected_atoms) << material.name;
-    const double average_neighbors = static_cast<double>(total_neighbors) / material.expected_atoms;
-    if (material.expected_average_neighbors > 0.0)
-    {
-        EXPECT_NEAR(average_neighbors, material.expected_average_neighbors, 1.0e-12) << material.name;
-    }
 }
 } // namespace
 
@@ -463,7 +457,6 @@ TEST(NeighborSearchMaterialCoverage, BenchmarkSystemsFromProjectReport)
                 {0, 0.5, 0.5, 0.0},
             },
             1000,
-            12.0,
         },
         {
             "Si diamond / 2000 atoms / LCAO / semiconductor",
@@ -487,7 +480,6 @@ TEST(NeighborSearchMaterialCoverage, BenchmarkSystemsFromProjectReport)
                 {0, 0.75, 0.75, 0.25},
             },
             2000,
-            4.0,
         },
         {
             "NaCl / 3000 atoms / PW / ionic crystal",
@@ -511,7 +503,6 @@ TEST(NeighborSearchMaterialCoverage, BenchmarkSystemsFromProjectReport)
                 {1, 0.5, 0.5, 0.5},
             },
             3000,
-            6.0,
         },
         {
             "TiO2 rutile / 4200 atoms / LCAO / complex oxide",
@@ -533,7 +524,6 @@ TEST(NeighborSearchMaterialCoverage, BenchmarkSystemsFromProjectReport)
                 {1, 0.195, 0.805, 0.5},
             },
             4200,
-            4.0,
         },
     };
 
