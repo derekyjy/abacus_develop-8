@@ -157,14 +157,16 @@ void expect_sltk_material_result(const SltkMaterialCase& material, std::ofstream
     ASSERT_EQ(total_atoms, material.expected_atoms) << material.name;
 
     Grid_Driver grid_d(PARAM.input.test_deconstructor, PARAM.input.test_grid);
-    const auto start = std::chrono::steady_clock::now();
+    const auto total_start = std::chrono::steady_clock::now();
+    const auto build_start = std::chrono::steady_clock::now();
     grid_d.init(ofs, *ucell, material.cutoff, true);
-    const auto finish = std::chrono::steady_clock::now();
-    const double elapsed_ms = std::chrono::duration<double, std::milli>(finish - start).count();
+    const auto build_finish = std::chrono::steady_clock::now();
+    const double build_ms = std::chrono::duration<double, std::milli>(build_finish - build_start).count();
 
     long long total_neighbors = 0;
     int atoms_with_neighbors = 0;
     AdjacentAtomInfo adjs;
+    const auto traverse_start = std::chrono::steady_clock::now();
     for (int type = 0; type < ucell->ntype; ++type)
     {
         for (int atom = 0; atom < ucell->atoms[type].na; ++atom)
@@ -186,6 +188,9 @@ void expect_sltk_material_result(const SltkMaterialCase& material, std::ofstream
             EXPECT_EQ(adjs.box.back().z, 0) << material.name;
         }
     }
+    const auto traverse_finish = std::chrono::steady_clock::now();
+    const double traverse_ms = std::chrono::duration<double, std::milli>(traverse_finish - traverse_start).count();
+    const double total_ms = std::chrono::duration<double, std::milli>(traverse_finish - total_start).count();
 
     EXPECT_EQ(atoms_with_neighbors, material.expected_atoms) << material.name;
     EXPECT_GT(total_neighbors, material.expected_atoms) << material.name;
@@ -196,7 +201,8 @@ void expect_sltk_material_result(const SltkMaterialCase& material, std::ofstream
         EXPECT_NEAR(average_neighbors, material.expected_average_neighbors, 1.0e-12) << material.name;
     }
     std::cout << "[sltk] " << material.name << ": atoms=" << material.expected_atoms
-              << ", avg_neighbors=" << average_neighbors << ", build_ms=" << elapsed_ms << std::endl;
+              << ", avg_neighbors=" << average_neighbors << ", build_ms=" << build_ms
+              << ", traverse_ms=" << traverse_ms << ", total_ms=" << total_ms << std::endl;
 }
 } // namespace
 
