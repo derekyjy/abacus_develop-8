@@ -2,6 +2,135 @@
 #include "../neighbor_search.h"
 #include "../unitcell_plus.h"
 
+#include <numeric>
+#include <string>
+#include <tuple>
+
+namespace
+{
+struct MaterialNeighborCase
+{
+    std::string name;
+    int nx;
+    int ny;
+    int nz;
+    double lattice_x;
+    double lattice_y;
+    double lattice_z;
+    double cutoff;
+    int ntype;
+    std::vector<int> type_counts_per_cell;
+    std::vector<std::tuple<int, double, double, double>> basis;
+    int expected_atoms;
+    double expected_average_neighbors;
+};
+
+UnitCellPlus make_crystal_case(const MaterialNeighborCase& material)
+{
+    UnitCellPlus ucell;
+    ucell.lat0 = 1.0;
+    ucell.ntype = material.ntype;
+    ucell.na.assign(material.ntype, 0);
+    ucell.latvec.e11 = material.nx * material.lattice_x;
+    ucell.latvec.e12 = 0.0;
+    ucell.latvec.e13 = 0.0;
+    ucell.latvec.e21 = 0.0;
+    ucell.latvec.e22 = material.ny * material.lattice_y;
+    ucell.latvec.e23 = 0.0;
+    ucell.latvec.e31 = 0.0;
+    ucell.latvec.e32 = 0.0;
+    ucell.latvec.e33 = material.nz * material.lattice_z;
+    ucell.omega = ucell.latvec.e11 * ucell.latvec.e22 * ucell.latvec.e33;
+
+    std::vector<std::vector<ModuleBase::Vector3<double>>> atoms_by_type(material.ntype);
+    int generated_atoms = 0;
+    for (int ix = 0; ix < material.nx; ++ix)
+    {
+        for (int iy = 0; iy < material.ny; ++iy)
+        {
+            for (int iz = 0; iz < material.nz; ++iz)
+            {
+                for (const auto& atom_basis : material.basis)
+                {
+                    if (generated_atoms >= material.expected_atoms)
+                    {
+                        break;
+                    }
+                    const int type = std::get<0>(atom_basis);
+                    const double fx = std::get<1>(atom_basis);
+                    const double fy = std::get<2>(atom_basis);
+                    const double fz = std::get<3>(atom_basis);
+                    atoms_by_type[type].push_back(ModuleBase::Vector3<double>(
+                        (ix + fx) * material.lattice_x,
+                        (iy + fy) * material.lattice_y,
+                        (iz + fz) * material.lattice_z));
+                    ++generated_atoms;
+                }
+            }
+        }
+    }
+
+    for (int type = 0; type < material.ntype; ++type)
+    {
+        ucell.na[type] = static_cast<int>(atoms_by_type[type].size());
+        ucell.tau.insert(ucell.tau.end(), atoms_by_type[type].begin(), atoms_by_type[type].end());
+    }
+    ucell.nat = static_cast<int>(ucell.tau.size());
+    ucell.compute_naa();
+    return ucell;
+}
+
+void expect_valid_neighbor_result(const MaterialNeighborCase& material)
+{
+    ASSERT_EQ(material.type_counts_per_cell.size(), static_cast<size_t>(material.ntype)) << material.name;
+    std::vector<int> actual_type_counts_per_cell(material.ntype, 0);
+    for (const auto& atom_basis : material.basis)
+    {
+        ++actual_type_counts_per_cell[std::get<0>(atom_basis)];
+    }
+    ASSERT_EQ(actual_type_counts_per_cell, material.type_counts_per_cell) << material.name;
+
+    UnitCellPlus ucell = make_crystal_case(material);
+    ASSERT_EQ(ucell.nat, material.expected_atoms) << material.name;
+    ASSERT_EQ(std::accumulate(ucell.na.begin(), ucell.na.end(), 0), material.expected_atoms) << material.name;
+
+    NeighborSearch ns;
+    ns.init(ucell, material.cutoff, 0);
+    ns.build_neighbors();
+
+    NeighborList& list = ns.get_neighbor_list();
+    ASSERT_EQ(ns.inside_atoms.size(), static_cast<size_t>(material.expected_atoms)) << material.name;
+    ASSERT_EQ(list.nlocal, material.expected_atoms) << material.name;
+    ASSERT_EQ(list.numneigh.size(), static_cast<size_t>(material.expected_atoms)) << material.name;
+    ASSERT_EQ(list.firstneigh.size(), static_cast<size_t>(material.expected_atoms)) << material.name;
+
+    int total_neighbors = 0;
+    int atoms_with_neighbors = 0;
+    for (int atom = 0; atom < material.expected_atoms; ++atom)
+    {
+        EXPECT_GE(list.numneigh[atom], 0) << material.name;
+        total_neighbors += list.numneigh[atom];
+        if (list.numneigh[atom] > 0)
+        {
+            ++atoms_with_neighbors;
+            ASSERT_NE(list.firstneigh[atom], nullptr) << material.name;
+        }
+        for (int neigh = 0; neigh < list.numneigh[atom]; ++neigh)
+        {
+            EXPECT_NE(list.firstneigh[atom][neigh], ns.inside_atoms[atom].atom_id) << material.name;
+        }
+    }
+
+    EXPECT_EQ(atoms_with_neighbors, material.expected_atoms) << material.name;
+    EXPECT_GT(total_neighbors, material.expected_atoms) << material.name;
+    const double average_neighbors = static_cast<double>(total_neighbors) / material.expected_atoms;
+    if (material.expected_average_neighbors > 0.0)
+    {
+        EXPECT_NEAR(average_neighbors, material.expected_average_neighbors, 1.0e-12) << material.name;
+    }
+}
+} // namespace
+
 TEST(NeighborSearchTest, TwoAtomsNeighbor)
 {
     UnitCellPlus ucell;
@@ -311,6 +440,107 @@ TEST(NeighborSearchDecompose_SmallSizes, TwoAndOne)
     EXPECT_EQ(nx, 1);
     EXPECT_EQ(ny, 1);
     EXPECT_EQ(nz, 1);
+}
+
+TEST(NeighborSearchMaterialCoverage, BenchmarkSystemsFromProjectReport)
+{
+    const std::vector<MaterialNeighborCase> materials = {
+        {
+            "Al fcc / 1000 atoms / PW / metal",
+            10,
+            5,
+            5,
+            2.0,
+            2.0,
+            2.0,
+            1.5,
+            1,
+            {4},
+            {
+                {0, 0.0, 0.0, 0.0},
+                {0, 0.0, 0.5, 0.5},
+                {0, 0.5, 0.0, 0.5},
+                {0, 0.5, 0.5, 0.0},
+            },
+            1000,
+            12.0,
+        },
+        {
+            "Si diamond / 2000 atoms / LCAO / semiconductor",
+            10,
+            5,
+            5,
+            2.4,
+            2.4,
+            2.4,
+            1.25,
+            1,
+            {8},
+            {
+                {0, 0.0, 0.0, 0.0},
+                {0, 0.0, 0.5, 0.5},
+                {0, 0.5, 0.0, 0.5},
+                {0, 0.5, 0.5, 0.0},
+                {0, 0.25, 0.25, 0.25},
+                {0, 0.25, 0.75, 0.75},
+                {0, 0.75, 0.25, 0.75},
+                {0, 0.75, 0.75, 0.25},
+            },
+            2000,
+            4.0,
+        },
+        {
+            "NaCl / 3000 atoms / PW / ionic crystal",
+            15,
+            5,
+            5,
+            2.4,
+            2.4,
+            2.4,
+            1.35,
+            2,
+            {4, 4},
+            {
+                {0, 0.0, 0.0, 0.0},
+                {0, 0.0, 0.5, 0.5},
+                {0, 0.5, 0.0, 0.5},
+                {0, 0.5, 0.5, 0.0},
+                {1, 0.5, 0.0, 0.0},
+                {1, 0.0, 0.5, 0.0},
+                {1, 0.0, 0.0, 0.5},
+                {1, 0.5, 0.5, 0.5},
+            },
+            3000,
+            6.0,
+        },
+        {
+            "TiO2 rutile / 4200 atoms / LCAO / complex oxide",
+            10,
+            10,
+            7,
+            2.4,
+            2.4,
+            1.56,
+            1.25,
+            2,
+            {2, 4},
+            {
+                {0, 0.0, 0.0, 0.0},
+                {0, 0.5, 0.5, 0.5},
+                {1, 0.305, 0.305, 0.0},
+                {1, 0.695, 0.695, 0.0},
+                {1, 0.805, 0.195, 0.5},
+                {1, 0.195, 0.805, 0.5},
+            },
+            4200,
+            4.0,
+        },
+    };
+
+    for (const auto& material : materials)
+    {
+        expect_valid_neighbor_result(material);
+    }
 }
 
 // end of additional tests
