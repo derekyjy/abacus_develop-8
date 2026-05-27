@@ -16,8 +16,9 @@ find_library(MSMPI_LIB msmpi PATHS "${MSMPI_LIB_DIR}" REQUIRED)
 
 add_executable(benchmark_parallel benchmark_parallel.cpp)
 add_executable(benchmark_grid_parallel benchmark_grid_parallel.cpp)
+add_executable(material_benchmark_parallel material_benchmark_parallel.cpp)
 
-foreach(target_name benchmark_parallel benchmark_grid_parallel)
+foreach(target_name benchmark_parallel benchmark_grid_parallel material_benchmark_parallel)
     target_include_directories(${target_name} PRIVATE "${MSMPI_INCLUDE_DIR}")
     target_link_libraries(${target_name} PRIVATE "${MSMPI_LIB}")
     if(MSVC)
