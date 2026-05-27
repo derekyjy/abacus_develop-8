@@ -5,6 +5,10 @@
 #include "source_base/memory.h"
 #include "source_base/timer.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 Grid::Grid(const int& test_grid_in) : test_grid(test_grid_in)
 {
 }
@@ -309,6 +313,69 @@ void Grid::Construct_Adjacent_near_box(const FAtom& fatom)
         }
     }
     ModuleBase::timer::end("Grid", "adj_near_box");
+}
+
+void Grid::Construct_Adjacent_omp(const UnitCell& ucell)
+{
+#ifdef _OPENMP
+    ModuleBase::timer::start("Grid", "constru_adj_omp");
+
+    omp_lock_t* locks = new omp_lock_t[ucell.ntype];
+    for (int i = 0; i < ucell.ntype; i++)
+    {
+        omp_init_lock(&locks[i]);
+    }
+
+#pragma omp parallel
+    {
+#pragma omp for schedule(dynamic, 1) nowait
+        for (int i_type = 0; i_type < ucell.ntype; i_type++)
+        {
+            for (int j_atom = 0; j_atom < ucell.atoms[i_type].na; j_atom++)
+            {
+                FAtom atom(ucell.atoms[i_type].tau[j_atom].x,
+                           ucell.atoms[i_type].tau[j_atom].y,
+                           ucell.atoms[i_type].tau[j_atom].z,
+                           i_type,
+                           j_atom,
+                           0, 0, 0);
+
+                for (int box_i_x_adj = 0; box_i_x_adj < glayerX + glayerX_minus; box_i_x_adj++)
+                {
+                    for (int box_i_y_adj = 0; box_i_y_adj < glayerY + glayerY_minus; box_i_y_adj++)
+                    {
+                        for (int box_i_z_adj = 0; box_i_z_adj < glayerZ + glayerZ_minus; box_i_z_adj++)
+                        {
+                            for (auto& fatom2 : this->atoms_in_box[box_i_x_adj][box_i_y_adj][box_i_z_adj])
+                            {
+                                double dx = atom.x - fatom2.x;
+                                double dy = atom.y - fatom2.y;
+                                double dz = atom.z - fatom2.z;
+                                double dr = dx * dx + dy * dy + dz * dz;
+                                if (dr != 0.0 && dr <= this->sradius2)
+                                {
+                                    omp_set_lock(&locks[i_type]);
+                                    all_adj_info[atom.type][atom.natom].push_back(&fatom2);
+                                    omp_unset_lock(&locks[i_type]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < ucell.ntype; i++)
+    {
+        omp_destroy_lock(&locks[i]);
+    }
+    delete[] locks;
+
+    ModuleBase::timer::end("Grid", "constru_adj_omp");
+#else
+    Construct_Adjacent(ucell);
+#endif
 }
 
 void Grid::Construct_Adjacent_final(const FAtom& fatom1,

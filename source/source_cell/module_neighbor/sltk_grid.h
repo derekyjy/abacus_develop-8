@@ -93,6 +93,9 @@ class Grid
     {
         return glayerZ_minus;
     }
+
+    void Construct_Adjacent_omp(const UnitCell& ucell);
+
   private:
     int test_grid;
 
