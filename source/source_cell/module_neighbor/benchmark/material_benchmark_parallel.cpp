@@ -42,26 +42,6 @@ std::vector<AtomData> gen_crystal(const MaterialCase& m)
     return a;
 }
 
-std::vector<AtomData> gen_cluster(int n, double box)
-{
-    std::vector<AtomData> a(n);
-    std::srand(42);
-    double cx = box * 0.25, cy = box * 0.25, cz = box * 0.25, cr = box * 0.06;
-    int na = n * 7 / 10;
-    for (int i = 0; i < na; i++)
-    {
-        double r = cr * std::pow(rand() / (double)RAND_MAX, 1.0 / 3.0);
-        double th = 6.283185307 * rand() / RAND_MAX;
-        double ph = std::acos(2.0 * rand() / RAND_MAX - 1.0);
-        a[i] = {cx + r * std::sin(ph) * std::cos(th),
-                cy + r * std::sin(ph) * std::sin(th),
-                cz + r * std::cos(ph), 0, i};
-    }
-    for (int i = na; i < n; i++)
-        a[i] = {box * rand() / RAND_MAX, box * rand() / RAND_MAX, box * rand() / RAND_MAX, 0, i};
-    return a;
-}
-
 struct Grid
 {
     int nx, ny, nz;
@@ -285,22 +265,6 @@ int main(int argc, char** argv)
         {
             double u = np * nt;
             rs.push_back({m.n, (int)at.size(), ser, par, ser / par, ser / par / u * 100});
-        }
-    }
-    {
-        double cut = 3.0;
-        std::vector<AtomData> at = gen_cluster(5000, 100.0);
-        double ser = 0;
-        int snb = 0;
-        if (rk == 0)
-            ser = run_serial(at, cut, snb);
-        double par = 0;
-        int pnb = 0;
-        par = run_parallel(at, cut, MPI_COMM_WORLD, pnb);
-        if (rk == 0)
-        {
-            double u = np * nt;
-            rs.push_back({"Cluster", 5000, ser, par, ser / par, ser / par / u * 100});
         }
     }
 
