@@ -181,7 +181,7 @@ int main(int argc, char** argv)
         std::cout << "\n============================================================" << std::endl;
         std::cout << "  ABACUS Neighbor Search - MPI+OpenMP Benchmark" << std::endl;
         std::cout << "  Cores: " << np * nt << " (" << np << " MPI x " << nt << " OMP)" << std::endl;
-        std::cout << "  Algo: Full-traversal | Crystals: 8x scaled" << std::endl;
+        std::cout << "  Algo: Full-traversal (matches ABACUS Construct_Adjacent_near_box)" << std::endl;
         std::cout << "  Comm: MPI_Iallreduce (non-blocking)" << std::endl;
         std::cout << "============================================================\n" << std::endl;
     }
