@@ -38,6 +38,7 @@ std::vector<AtomData> gen_crystal(const Mate& m)
 struct Grid
 {
     int nx, ny, nz;
+    double x0, y0, z0;
     std::vector<int> cell_offsets;
     std::vector<int> cell_data;
     std::vector<int> non_empty;
@@ -46,22 +47,22 @@ struct Grid
 Grid build_grid(const std::vector<AtomData>& a, double gs)
 {
     Grid gr; int n = (int)a.size();
-    double x0 = a[0].x, y0 = a[0].y, z0 = a[0].z;
+    gr.x0 = a[0].x, gr.y0 = a[0].y, gr.z0 = a[0].z;
     double xm = a[0].x, ym = a[0].y, zm = a[0].z;
     for (auto& t : a) {
-        x0 = std::min(x0, t.x); xm = std::max(xm, t.x);
-        y0 = std::min(y0, t.y); ym = std::max(ym, t.y);
-        z0 = std::min(z0, t.z); zm = std::max(zm, t.z);
+        gr.x0 = std::min(gr.x0, t.x); xm = std::max(xm, t.x);
+        gr.y0 = std::min(gr.y0, t.y); ym = std::max(ym, t.y);
+        gr.z0 = std::min(gr.z0, t.z); zm = std::max(zm, t.z);
     }
-    gr.nx = (int)std::ceil((xm - x0) / gs) + 1;
-    gr.ny = (int)std::ceil((ym - y0) / gs) + 1;
-    gr.nz = (int)std::ceil((zm - z0) / gs) + 1;
+    gr.nx = (int)std::ceil((xm - gr.x0) / gs) + 1;
+    gr.ny = (int)std::ceil((ym - gr.y0) / gs) + 1;
+    gr.nz = (int)std::ceil((zm - gr.z0) / gs) + 1;
     int total = gr.nx * gr.ny * gr.nz;
     std::vector<std::vector<int>> bins(total);
     for (int i = 0; i < n; i++) {
-        int bx = std::max(0, std::min(gr.nx - 1, (int)std::floor((a[i].x - x0) / gs)));
-        int by = std::max(0, std::min(gr.ny - 1, (int)std::floor((a[i].y - y0) / gs)));
-        int bz = std::max(0, std::min(gr.nz - 1, (int)std::floor((a[i].z - z0) / gs)));
+        int bx = std::max(0, std::min(gr.nx - 1, (int)std::floor((a[i].x - gr.x0) / gs)));
+        int by = std::max(0, std::min(gr.ny - 1, (int)std::floor((a[i].y - gr.y0) / gs)));
+        int bz = std::max(0, std::min(gr.nz - 1, (int)std::floor((a[i].z - gr.z0) / gs)));
         bins[bx * gr.ny * gr.nz + by * gr.nz + bz].push_back(i);
     }
     gr.cell_offsets.resize(total + 1, 0);
@@ -142,8 +143,8 @@ double run_parallel(const std::vector<AtomData>& a, double cut, MPI_Comm comm, i
                 }
                 for (int idx = jstart; idx < off + count; idx++) {
                     int j = gr.cell_data[idx];
-                    double dx = xi - ax[j], dy = yi - ay[j], dz = zi - az[j];
-                    if (dx * dx + dy * dy + dz * dz < c2) lc += 1.0;
+                    double dx2 = xi - ax[j], dy2 = yi - ay[j], dz2 = zi - az[j];
+                    if (dx2 * dx2 + dy2 * dy2 + dz2 * dz2 < c2) lc += 1.0;
                 }
             }
         }
@@ -184,7 +185,7 @@ int main(int argc, char** argv)
         std::cout << "\n============================================================" << std::endl;
         std::cout << "  ABACUS Neighbor Search - MPI+OpenMP Benchmark" << std::endl;
         std::cout << "  Cores: " << np * nt << " (" << np << " MPI x " << nt << " OMP)" << std::endl;
-        std::cout << "  Opt: non-empty cells + binary-search j>i + guided schedule" << std::endl;
+        std::cout << "  Serial+Parallel: Full-traversal (matches ABACUS)" << std::endl;
         std::cout << "============================================================\n" << std::endl;
     }
 
