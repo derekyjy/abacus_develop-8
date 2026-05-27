@@ -22,7 +22,7 @@ foreach(target_name benchmark_parallel benchmark_grid_parallel material_benchmar
     target_include_directories(${target_name} PRIVATE "${MSMPI_INCLUDE_DIR}")
     target_link_libraries(${target_name} PRIVATE "${MSMPI_LIB}")
     if(MSVC)
-        target_compile_options(${target_name} PRIVATE /openmp)
+        target_compile_options(${target_name} PRIVATE /openmp /arch:AVX2)
     else()
         target_compile_options(${target_name} PRIVATE -fopenmp)
         target_link_libraries(${target_name} PRIVATE OpenMP::OpenMP_CXX)

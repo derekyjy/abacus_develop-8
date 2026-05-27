@@ -38,7 +38,6 @@ std::vector<AtomData> gen_crystal(const Mate& m)
 struct Grid
 {
     int nx, ny, nz;
-    double x0, y0, z0;
     std::vector<int> cell_offsets;
     std::vector<int> cell_data;
     std::vector<int> non_empty;
@@ -47,26 +46,24 @@ struct Grid
 Grid build_grid(const std::vector<AtomData>& a, double gs)
 {
     Grid gr; int n = (int)a.size();
-    gr.x0 = gr.y0 = gr.z0 = a[0].x;
+    double x0 = a[0].x, y0 = a[0].y, z0 = a[0].z;
     double xm = a[0].x, ym = a[0].y, zm = a[0].z;
     for (auto& t : a) {
-        gr.x0 = std::min(gr.x0, t.x); xm = std::max(xm, t.x);
-        gr.y0 = std::min(gr.y0, t.y); ym = std::max(ym, t.y);
-        gr.z0 = std::min(gr.z0, t.z); zm = std::max(zm, t.z);
+        x0 = std::min(x0, t.x); xm = std::max(xm, t.x);
+        y0 = std::min(y0, t.y); ym = std::max(ym, t.y);
+        z0 = std::min(z0, t.z); zm = std::max(zm, t.z);
     }
-    gr.nx = (int)std::ceil((xm - gr.x0) / gs) + 1;
-    gr.ny = (int)std::ceil((ym - gr.y0) / gs) + 1;
-    gr.nz = (int)std::ceil((zm - gr.z0) / gs) + 1;
-
+    gr.nx = (int)std::ceil((xm - x0) / gs) + 1;
+    gr.ny = (int)std::ceil((ym - y0) / gs) + 1;
+    gr.nz = (int)std::ceil((zm - z0) / gs) + 1;
     int total = gr.nx * gr.ny * gr.nz;
     std::vector<std::vector<int>> bins(total);
     for (int i = 0; i < n; i++) {
-        int bx = std::max(0, std::min(gr.nx - 1, (int)std::floor((a[i].x - gr.x0) / gs)));
-        int by = std::max(0, std::min(gr.ny - 1, (int)std::floor((a[i].y - gr.y0) / gs)));
-        int bz = std::max(0, std::min(gr.nz - 1, (int)std::floor((a[i].z - gr.z0) / gs)));
+        int bx = std::max(0, std::min(gr.nx - 1, (int)std::floor((a[i].x - x0) / gs)));
+        int by = std::max(0, std::min(gr.ny - 1, (int)std::floor((a[i].y - y0) / gs)));
+        int bz = std::max(0, std::min(gr.nz - 1, (int)std::floor((a[i].z - z0) / gs)));
         bins[bx * gr.ny * gr.nz + by * gr.nz + bz].push_back(i);
     }
-
     gr.cell_offsets.resize(total + 1, 0);
     for (int i = 0; i < total; i++) {
         gr.cell_offsets[i + 1] = gr.cell_offsets[i] + (int)bins[i].size();
@@ -75,7 +72,6 @@ Grid build_grid(const std::vector<AtomData>& a, double gs)
     gr.cell_data.resize(gr.cell_offsets[total]);
     for (int i = 0; i < total; i++)
         std::copy(bins[i].begin(), bins[i].end(), gr.cell_data.begin() + gr.cell_offsets[i]);
-
     return gr;
 }
 
@@ -84,18 +80,26 @@ double run_serial(const std::vector<AtomData>& a, double cut, int& nb)
     double t0 = omp_get_wtime(), gs = cut + 0.1, c2 = cut * cut, cnt = 0;
     int n = (int)a.size();
     Grid gr = build_grid(a, gs);
+    int nne = (int)gr.non_empty.size();
+
+    std::vector<double> ax(n), ay(n), az(n);
+    for (int i = 0; i < n; i++) { ax[i] = a[i].x; ay[i] = a[i].y; az[i] = a[i].z; }
 
     for (int i = 0; i < n; i++) {
-        for (int ci : gr.non_empty) {
-            int bz = ci % gr.nz, tmp = ci / gr.nz;
-            int by = tmp % gr.ny, bx = tmp / gr.ny;
-            int off = gr.cell_offsets[ci], count = gr.cell_offsets[ci + 1] - off;
-            auto it = std::lower_bound(gr.cell_data.begin() + off, gr.cell_data.begin() + off + count, i + 1);
-            for (; it != gr.cell_data.begin() + off + count; ++it) {
-                int j = *it;
-                double dx = a[i].x - a[j].x;
-                double dy = a[i].y - a[j].y;
-                double dz = a[i].z - a[j].z;
+        double xi = ax[i], yi = ay[i], zi = az[i];
+        for (int ci = 0; ci < nne; ci++) {
+            int cidx = gr.non_empty[ci];
+            int off = gr.cell_offsets[cidx], count = gr.cell_offsets[cidx + 1] - off;
+            int first = gr.cell_data[off];
+            int jstart = off;
+            if (first > i) {
+            } else if (gr.cell_data[off + count - 1] <= i) { continue; } else {
+                auto it = std::lower_bound(gr.cell_data.begin() + off, gr.cell_data.begin() + off + count, i + 1);
+                jstart = (int)(it - gr.cell_data.begin());
+            }
+            for (int idx = jstart; idx < off + count; idx++) {
+                int j = gr.cell_data[idx];
+                double dx = xi - ax[j], dy = yi - ay[j], dz = zi - az[j];
                 if (dx * dx + dy * dy + dz * dz < c2) cnt += 1.0;
             }
         }
@@ -112,6 +116,9 @@ double run_parallel(const std::vector<AtomData>& a, double cut, MPI_Comm comm, i
     Grid gr = build_grid(a, gs);
     int nne = (int)gr.non_empty.size();
 
+    std::vector<double> ax(n), ay(n), az(n);
+    for (int i = 0; i < n; i++) { ax[i] = a[i].x; ay[i] = a[i].y; az[i] = a[i].z; }
+
     int base = n / np, rem = n % np;
     int start = rk * base + std::min(rk, rem);
     int end = start + base + (rk < rem ? 1 : 0);
@@ -120,17 +127,22 @@ double run_parallel(const std::vector<AtomData>& a, double cut, MPI_Comm comm, i
 #pragma omp parallel
     {
         double lc = 0;
-#pragma omp for schedule(guided) nowait
+#pragma omp for schedule(static) nowait
         for (int i = start; i < end; i++) {
+            double xi = ax[i], yi = ay[i], zi = az[i];
             for (int ci = 0; ci < nne; ci++) {
                 int cidx = gr.non_empty[ci];
                 int off = gr.cell_offsets[cidx], count = gr.cell_offsets[cidx + 1] - off;
-                auto it = std::lower_bound(gr.cell_data.begin() + off, gr.cell_data.begin() + off + count, i + 1);
-                for (; it != gr.cell_data.begin() + off + count; ++it) {
-                    int j = *it;
-                    double dx = a[i].x - a[j].x;
-                    double dy = a[i].y - a[j].y;
-                    double dz = a[i].z - a[j].z;
+                int first = gr.cell_data[off];
+                int jstart = off;
+                if (first > i) {
+                } else if (gr.cell_data[off + count - 1] <= i) { continue; } else {
+                    auto it = std::lower_bound(gr.cell_data.begin() + off, gr.cell_data.begin() + off + count, i + 1);
+                    jstart = (int)(it - gr.cell_data.begin());
+                }
+                for (int idx = jstart; idx < off + count; idx++) {
+                    int j = gr.cell_data[idx];
+                    double dx = xi - ax[j], dy = yi - ay[j], dz = zi - az[j];
                     if (dx * dx + dy * dy + dz * dz < c2) lc += 1.0;
                 }
             }
