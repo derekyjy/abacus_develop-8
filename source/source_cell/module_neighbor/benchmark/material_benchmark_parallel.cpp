@@ -123,7 +123,7 @@ double run_parallel(const std::vector<AtomData>& a, double cut, MPI_Comm comm, i
 #pragma omp parallel
     {
         double lc = 0;
-#pragma omp for schedule(static) nowait
+#pragma omp for schedule(dynamic) nowait
         for (int i = start; i < end; i++)
         {
             for (int bx = 0; bx < nx; bx++)
