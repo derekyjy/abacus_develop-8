@@ -6,6 +6,7 @@
 #include <mpi.h>
 #include <omp.h>
 #include <chrono>
+#include <array>
 #include <vector>
 #include <utility>
 
@@ -25,7 +26,53 @@ class GridParallel : public Grid
     bool compare_adj_info(const Grid& other) const;
 
   private:
-    void broadcast_atoms_data(MPI_Comm comm);
+    struct DomainDecomposition
+    {
+        int px;
+        int py;
+        int pz;
+    };
+
+    struct DomainBounds
+    {
+        int x_begin;
+        int x_end;
+        int y_begin;
+        int y_end;
+        int z_begin;
+        int z_end;
+    };
+
+    DomainDecomposition choose_domain_decomposition(int mpi_size) const;
+
+    DomainBounds rank_domain_bounds(int rank, const DomainDecomposition& decomp) const;
+
+    bool atom_in_domain(const FAtom& atom, const DomainBounds& bounds);
+
+    std::array<int, 3> rank_domain_coord(int rank, const DomainDecomposition& decomp) const;
+
+    int domain_rank_from_coord(int x, int y, int z, const DomainDecomposition& decomp) const;
+
+    int atom_box_x(const FAtom& atom) const;
+
+    int atom_box_y(const FAtom& atom) const;
+
+    int atom_box_z(const FAtom& atom) const;
+
+    bool atom_in_ghost_layer(const FAtom& atom,
+                             const DomainBounds& bounds,
+                             int dx,
+                             int dy,
+                             int dz,
+                             int search_span) const;
+
+    std::vector<FAtom> exchange_ghost_atoms(const std::vector<FAtom>& owned_atoms,
+                                            const DomainBounds& bounds,
+                                            const DomainDecomposition& decomp,
+                                            MPI_Comm comm) const;
+
+    void rebuild_local_search_grid(const std::vector<FAtom>& owned_atoms,
+                                   const std::vector<FAtom>& ghost_atoms);
 
     struct NeighborEntry
     {
