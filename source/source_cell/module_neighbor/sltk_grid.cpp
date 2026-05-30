@@ -210,26 +210,10 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
 
     this->box_edge_length = sradius + 0.1; // To avoid edge cases, the size of the box is slightly increased.
 
-/*  warning box algorithm   
     this->box_nx = std::ceil((this->x_max - this->x_min) / box_edge_length) + 1;
     this->box_ny = std::ceil((this->y_max - this->y_min) / box_edge_length) + 1;
     this->box_nz = std::ceil((this->z_max - this->z_min) / box_edge_length) + 1;
     ModuleBase::GlobalFunc::OUT(ofs_in, "BoxNumber", box_nx, box_ny, box_nz);
-
-    atoms_in_box.resize(this->box_nx);
-    for (int i = 0; i < this->box_nx; i++)
-    {
-        atoms_in_box[i].resize(this->box_ny);
-        for (int j = 0; j < this->box_ny; j++)
-        {
-            atoms_in_box[i][j].resize(this->box_nz);
-        }
-    }
- */
-    this->box_nx = glayerX + glayerX_minus;
-    this->box_ny = glayerY + glayerY_minus;
-    this->box_nz = glayerZ + glayerZ_minus;
-    ModuleBase::GlobalFunc::OUT(ofs_in, "Number of needed cells", box_nx, box_ny, box_nz);
 
     atoms_in_box.resize(this->box_nx);
     for (int i = 0; i < this->box_nx; i++)
@@ -255,10 +239,10 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
                         double z = ucell.atoms[i].tau[j].z + vec1[2] * ix + vec2[2] * iy + vec3[2] * iz;
                         FAtom atom(x, y, z, i, j, ix, iy, iz);
                         int box_i_x, box_i_y, box_i_z;
-                        //this->getBox(box_i_x, box_i_y, box_i_z, x, y, z);
-                        box_i_x = ix + glayerX_minus;
-                        box_i_y = iy + glayerY_minus;
-                        box_i_z = iz + glayerZ_minus;
+                        this->getBox(box_i_x, box_i_y, box_i_z, x, y, z);
+                        box_i_x = std::max(0, std::min(this->box_nx - 1, box_i_x));
+                        box_i_y = std::max(0, std::min(this->box_ny - 1, box_i_y));
+                        box_i_z = std::max(0, std::min(this->box_nz - 1, box_i_z));
                         this->atoms_in_box[box_i_x][box_i_y][box_i_z].push_back(atom);
                     }
                 }
