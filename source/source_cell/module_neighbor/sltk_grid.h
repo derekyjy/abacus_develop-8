@@ -93,6 +93,13 @@ class Grid
     {
         return glayerZ_minus;
     }
+
+    void Construct_Adjacent_omp(const UnitCell& ucell);
+
+  protected:
+    void Construct_Adjacent_near_box_local(const FAtom& fatom);
+    void Construct_Adjacent_final(const FAtom& fatom1, FAtom* fatom2);
+
   private:
     int test_grid;
 
@@ -100,7 +107,6 @@ class Grid
 
     void Construct_Adjacent(const UnitCell& ucell);
     void Construct_Adjacent_near_box(const FAtom& fatom);
-    void Construct_Adjacent_final(const FAtom& fatom1, FAtom* fatom2);
 
     void Check_Expand_Condition(const UnitCell& ucell);
     int glayerX=0;

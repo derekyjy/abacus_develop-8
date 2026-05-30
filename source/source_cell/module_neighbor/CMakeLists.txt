@@ -7,6 +7,10 @@ add_library(
     sltk_grid_driver.cpp
 )
 
+if(ENABLE_MPI)
+  target_sources(neighbor PRIVATE sltk_grid_parallel.cpp)
+endif()
+
 if(ENABLE_COVERAGE)
   add_coverage(neighbor)
 endif()
