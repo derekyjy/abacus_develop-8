@@ -231,12 +231,15 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
     ModuleBase::GlobalFunc::OUT(ofs_in, "Number of needed cells", box_nx, box_ny, box_nz);
 
     atoms_in_box.resize(this->box_nx);
+    box_bounds.resize(this->box_nx);
     for (int i = 0; i < this->box_nx; i++)
     {
         atoms_in_box[i].resize(this->box_ny);
+        box_bounds[i].resize(this->box_ny);
         for (int j = 0; j < this->box_ny; j++)
         {
             atoms_in_box[i][j].resize(this->box_nz);
+            box_bounds[i][j].resize(this->box_nz);
         }
     }
     for (int ix = -glayerX_minus; ix < glayerX; ix++)
@@ -259,6 +262,7 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
                         box_i_y = iy + glayerY_minus;
                         box_i_z = iz + glayerZ_minus;
                         this->atoms_in_box[box_i_x][box_i_y][box_i_z].push_back(atom);
+                        this->box_bounds[box_i_x][box_i_y][box_i_z].add_atom(atom);
                     }
                 }
             }
@@ -287,7 +291,7 @@ void Grid::Construct_Adjacent(const UnitCell& ucell)
 
     const int natom = static_cast<int>(atom_pairs.size());
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(guided, 16)
 #endif
     for (int i = 0; i < natom; i++)
     {
@@ -319,6 +323,12 @@ void Grid::Construct_Adjacent_near_box(const FAtom& fatom)
         {
             for (int box_i_z_adj = 0; box_i_z_adj < glayerZ + glayerZ_minus; box_i_z_adj++)
             {
+#ifndef SLTK_DISABLE_ADAPTIVE_BOX_PRUNING
+                if (!this->box_may_contain_neighbor(fatom, this->box_bounds[box_i_x_adj][box_i_y_adj][box_i_z_adj]))
+                {
+                    continue;
+                }
+#endif
                 for (auto &fatom2 : this->atoms_in_box[box_i_x_adj][box_i_y_adj][box_i_z_adj])
                 {
                     this->Construct_Adjacent_final(fatom, &fatom2);
@@ -360,6 +370,12 @@ void Grid::Construct_Adjacent_near_box_local(const FAtom& fatom)
         {
             for (int box_i_z_adj = z_begin; box_i_z_adj <= z_end; box_i_z_adj++)
             {
+#ifndef SLTK_DISABLE_ADAPTIVE_BOX_PRUNING
+                if (!this->box_may_contain_neighbor(fatom, this->box_bounds[box_i_x_adj][box_i_y_adj][box_i_z_adj]))
+                {
+                    continue;
+                }
+#endif
                 for (auto& fatom2 : this->atoms_in_box[box_i_x_adj][box_i_y_adj][box_i_z_adj])
                 {
                     this->Construct_Adjacent_final(fatom, &fatom2);
@@ -367,6 +383,33 @@ void Grid::Construct_Adjacent_near_box_local(const FAtom& fatom)
             }
         }
     }
+}
+
+bool Grid::box_may_contain_neighbor(const FAtom& fatom, const BoxBounds& bounds) const
+{
+    if (bounds.empty)
+    {
+        return false;
+    }
+
+    const auto axis_distance2 = [](const double value, const double lower, const double upper) {
+        if (value < lower)
+        {
+            const double diff = lower - value;
+            return diff * diff;
+        }
+        if (value > upper)
+        {
+            const double diff = value - upper;
+            return diff * diff;
+        }
+        return 0.0;
+    };
+
+    const double min_distance2 = axis_distance2(fatom.x, bounds.x_min, bounds.x_max)
+                               + axis_distance2(fatom.y, bounds.y_min, bounds.y_max)
+                               + axis_distance2(fatom.z, bounds.z_min, bounds.z_max);
+    return min_distance2 <= this->sradius2;
 }
 
 void Grid::Construct_Adjacent_omp(const UnitCell& ucell)

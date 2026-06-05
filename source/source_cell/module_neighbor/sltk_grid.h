@@ -4,7 +4,9 @@
 #include "source_cell/unitcell.h"
 #include "sltk_atom.h"
 
+#include <algorithm>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
@@ -53,6 +55,32 @@ class Grid
     // Stores the atoms after box partitioning.
     std::vector<std::vector<std::vector<AtomMap>>> atoms_in_box;
 
+    struct BoxBounds
+    {
+        double x_min = std::numeric_limits<double>::max();
+        double y_min = std::numeric_limits<double>::max();
+        double z_min = std::numeric_limits<double>::max();
+        double x_max = std::numeric_limits<double>::lowest();
+        double y_max = std::numeric_limits<double>::lowest();
+        double z_max = std::numeric_limits<double>::lowest();
+        bool empty = true;
+
+        void add_atom(const FAtom& atom)
+        {
+            x_min = std::min(x_min, atom.x);
+            y_min = std::min(y_min, atom.y);
+            z_min = std::min(z_min, atom.z);
+            x_max = std::max(x_max, atom.x);
+            y_max = std::max(y_max, atom.y);
+            z_max = std::max(z_max, atom.z);
+            empty = false;
+        }
+    };
+
+    // Per-box coordinate bounds used to skip boxes that cannot contain atoms
+    // within the current search radius.
+    std::vector<std::vector<std::vector<BoxBounds>>> box_bounds;
+
     // Stores the adjacent information of atoms. [ntype][natom][adj list]
     std::vector<std::vector< std::vector<FAtom *> >> all_adj_info;
     void clear_atoms()
@@ -62,6 +90,7 @@ class Grid
         all_adj_info.clear();
 
         atoms_in_box.clear();
+        box_bounds.clear();
     }
     void clear_adj_info()
     {
@@ -109,6 +138,7 @@ class Grid
     void Construct_Adjacent_near_box(const FAtom& fatom);
 
     void Check_Expand_Condition(const UnitCell& ucell);
+    bool box_may_contain_neighbor(const FAtom& fatom, const BoxBounds& bounds) const;
     int glayerX=0;
     int glayerX_minus=0;
     int glayerY=0;

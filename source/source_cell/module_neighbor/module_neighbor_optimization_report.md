@@ -2,111 +2,258 @@
 
 ## 1. 优化目标
 
-本次优化面向 ABACUS 旧版 `source/source_cell/module_neighbor` 近邻原子搜索模块，目标是按项目书 4.2 的并行划分策略改进现有网格搜索：
+本次优化面向 ABACUS 旧版 `source/source_cell/module_neighbor` 近邻原子搜索模块。项目书里提到的几个方向基本可以归到三类：先把搜索范围缩小，再把任务并行化，最后处理不同原子附近候选数量不均带来的负载差异。
 
-- 将原先对所有网格的全空间遍历改为只遍历当前原子所在网格附近的邻域网格。
-- 在旧主算法 `Grid::Construct_Adjacent()` 中启用 OpenMP 线程级并行。
-- 提供 MPI 三维空间域分解候选实现，将进程划分为 `Px x Py x Pz` 个空间子域。
-- 在 MPI 候选实现中加入幽灵原子交换，避免子域边界处漏掉跨进程邻居。
+本阶段实际完成了以下内容：
+
+- 保留旧接口 `Grid` / `Grid_Driver`，不改变上层调用方式。
+- 将原来的全空间 box 遍历改成局部邻域 box 搜索。
+- 在 `Grid::Construct_Adjacent()` 中启用 OpenMP 线程级并行。
+- 保留 `GridParallel` 中的 MPI 三维空间域划分和 ghost atom 交换候选实现。
+- 新增自适应 box 剪枝：根据候选 box 内真实原子的包围盒判断这个 box 是否可能含有半径内近邻。
+- 将 OpenMP 调度从静态分块改为 `guided` 调度，用于线程级动态负载均衡。
 
 ## 2. 原始问题
 
-旧算法中 `Construct_Adjacent_near_box()` 虽然计算了当前原子所在 box，但实际搜索时仍遍历全部 box：
+旧实现里 `Construct_Adjacent_near_box()` 虽然计算了当前原子所在 box，但真正搜索时仍然遍历扩胞后的全部 box：
 
 ```cpp
 for (int box_i_x_adj = 0; box_i_x_adj < glayerX + glayerX_minus; box_i_x_adj++)
+{
+    for (int box_i_y_adj = 0; box_i_y_adj < glayerY + glayerY_minus; box_i_y_adj++)
+    {
+        for (int box_i_z_adj = 0; box_i_z_adj < glayerZ + glayerZ_minus; box_i_z_adj++)
+        {
+            ...
+        }
+    }
+}
 ```
 
-这会导致每个原子都扫描整个扩展空间的所有网格，复杂度接近“原子数 x 网格总数”。当周期镜像层数和原子规模增大时，大量距离判断是不必要的。
+这样做的问题是很直接的：每个原子都要扫一遍扩展空间中的所有 box，大量 box 要么为空，要么距离当前原子很远。体系规模变大、周期镜像层数增加后，距离判断次数会迅速增加。
 
-## 3. 已完成修改
+另外，即使有 OpenMP 并行，不同原子的实际候选邻居数量也不完全一样。特别是在复杂氧化物、非均匀结构或边界附近，线程之间容易出现有的线程已经结束、有的线程还在处理大任务的情况。
 
-### 3.1 邻域网格搜索
+## 3. 已完成的优化
 
-新增 `Grid::Construct_Adjacent_near_box_local()`，搜索流程为：
+### 3.1 局部邻域 box 搜索
 
-1. 通过 `getBox()` 得到当前原子所在 box。
-2. 根据 `ceil(sradius / box_edge_length)` 计算需要检查的邻域 box 半径。
-3. 只遍历 `[center - span, center + span]` 范围内的局部 box。
-4. 保留原有距离判断 `dr <= sradius2`，保证不会误加入超出截断半径的原子。
-
-该优化已经并入旧主算法：
+主路径现在不再遍历全部 box，而是通过 `getBox()` 找到当前原子所在 box，再根据搜索半径计算需要检查的邻域跨度：
 
 ```cpp
-Grid::Construct_Adjacent()
+const int search_span = std::max(1, static_cast<int>(std::ceil(sradius / box_edge_length)));
+const int x_begin = std::max(0, box_i_x - search_span);
+const int x_end = std::min(box_nx - 1, box_i_x + search_span);
 ```
 
-默认主路径现在调用局部邻域搜索，而不是全空间网格遍历。
+随后只遍历 `[center - span, center + span]` 范围内的局部 box。最后仍然保留精确距离判断：
+
+```cpp
+if (dr != 0.0 && dr <= this->sradius2)
+{
+    all_adj_info[fatom1.type][fatom1.natom].push_back(fatom2);
+}
+```
+
+也就是说，这一步只是减少候选集合，不改变近邻判定标准。
 
 ### 3.2 OpenMP 并行
 
-`Grid::Construct_Adjacent()` 现在先构造原子任务列表，然后使用：
+`Grid::Construct_Adjacent()` 先把原胞内所有原子整理成任务列表：
+
+```cpp
+std::vector<std::pair<int, int>> atom_pairs;
+for (int i_type = 0; i_type < ucell.ntype; i_type++)
+{
+    for (int j_atom = 0; j_atom < ucell.atoms[i_type].na; j_atom++)
+    {
+        atom_pairs.push_back({i_type, j_atom});
+    }
+}
+```
+
+每个任务只写入一个原子的邻接表 `all_adj_info[type][natom]`，线程之间不会同时写同一个 vector，因此可以直接并行处理。
+
+### 3.3 自适应 box 剪枝
+
+这次新增的优化重点是自适应搜索。构建 `atoms_in_box` 时，同时记录每个 box 内真实原子的坐标包围盒：
+
+```cpp
+struct BoxBounds
+{
+    double x_min = std::numeric_limits<double>::max();
+    double y_min = std::numeric_limits<double>::max();
+    double z_min = std::numeric_limits<double>::max();
+    double x_max = std::numeric_limits<double>::lowest();
+    double y_max = std::numeric_limits<double>::lowest();
+    double z_max = std::numeric_limits<double>::lowest();
+    bool empty = true;
+};
+```
+
+放入原子时同步更新：
+
+```cpp
+this->atoms_in_box[box_i_x][box_i_y][box_i_z].push_back(atom);
+this->box_bounds[box_i_x][box_i_y][box_i_z].add_atom(atom);
+```
+
+搜索某个原子时，先计算该原子到候选 box 包围盒的最小可能距离。如果这个最小距离已经大于搜索半径，那么该 box 内所有原子都不可能成为近邻，可以直接跳过：
+
+```cpp
+if (!this->box_may_contain_neighbor(fatom, this->box_bounds[box_i_x_adj][box_i_y_adj][box_i_z_adj]))
+{
+    continue;
+}
+```
+
+核心判断如下：
+
+```cpp
+const double min_distance2 = axis_distance2(fatom.x, bounds.x_min, bounds.x_max)
+                           + axis_distance2(fatom.y, bounds.y_min, bounds.y_max)
+                           + axis_distance2(fatom.z, bounds.z_min, bounds.z_max);
+return min_distance2 <= this->sradius2;
+```
+
+这一步的意义是：不是机械地按照固定 `search_span` 扫所有邻域 box，而是根据每个 box 里实际原子的分布进一步缩小搜索范围。它仍然是精确剪枝，不会漏掉半径内近邻。
+
+为了做 A/B 测试，代码里保留了一个编译期关闭开关：
+
+```cpp
+#ifndef SLTK_DISABLE_ADAPTIVE_BOX_PRUNING
+...
+#endif
+```
+
+正常编译时该优化默认开启。
+
+### 3.4 动态负载均衡
+
+原来的 OpenMP 调度是静态分块：
 
 ```cpp
 #pragma omp parallel for schedule(static)
 ```
 
-并行处理每个原子的邻居搜索。每个线程写入不同原子的 `all_adj_info[type][natom]`，避免多个线程同时修改同一个邻居表。
+这对每个原子工作量差不多的体系没问题，但近邻搜索里每个原子要扫的候选 box 和候选原子数量不一定一样。当前改成：
 
-`Construct_Adjacent_omp()` 保留为兼容接口，目前转调 `Construct_Adjacent()`。
+```cpp
+#pragma omp parallel for schedule(guided, 16)
+```
 
-### 3.3 MPI 三维空间域分解
+`guided` 调度前期给线程较大的任务块，后期任务块逐渐变小。这样既能减少动态调度的频繁取任务开销，又能在尾部让空闲线程继续领取剩余任务。测试中它比 `dynamic,16` 更稳，也比原来的 `static` 更适合较大体系。
 
-`GridParallel` 中新增三维域分解逻辑：
+### 3.5 MPI 空间域划分和 ghost atom 交换
 
-- 自动枚举 MPI 进程数的三因子分解。
-- 选择子域形状更接近立方体的 `Px x Py x Pz`。
-- 每个 rank 根据自身三维坐标负责一个空间子域。
-- 本 rank 只为自己子域内的 owned atoms 构建邻居表。
+`GridParallel` 中已有 MPI 候选实现，主要包含：
 
-### 3.4 幽灵原子交换
+- 自动枚举 MPI 进程数的三因子分解，选择较接近立方体的 `Px x Py x Pz`。
+- 每个 rank 按三维坐标负责一个空间子域。
+- 子域边界附近的 owned atoms 会作为 ghost atoms 发给相邻 rank。
+- 本 rank 用 `owned atoms + ghost atoms` 重建局部搜索网格，避免跨进程边界漏邻居。
 
-MPI 候选实现中加入 ghost atom 交换：
+ghost atom 交换采用 26 邻域直接交换，通信路径清楚，后续仍可以继续优化打包和减少重复发送。
 
-- owned atom：当前 rank 子域内真正负责计算邻居表的原子。
-- ghost atom：相邻 rank 边界附近原子的只读副本。
+## 4. 测试方式
 
-每个 rank 从 owned atoms 中挑出靠近子域边界、距离小于搜索层厚度的原子，通过 `MPI_Isend` / `MPI_Irecv` 与 26 个相邻子域交换。随后用：
+完整 ABACUS 顶层 CMake 会继续查找 FFTW3、BLAS、LAPACK、ScaLAPACK 等依赖。当前机器上 FFTW3 已通过 Conda 安装，CMake 可以找到：
 
 ```text
-owned atoms + ghost atoms
+D:/Real_Softwares/anaconda/Library/lib/fftw3.lib
 ```
 
-重建本地搜索网格。搜索时只遍历 owned atoms，但候选邻居可以来自 owned atoms 或 ghost atoms，从而避免跨进程边界漏邻居。
+但顶层配置后续会卡在项目自带 `FindBLAS.cmake` / `FindLAPACK.cmake` 的递归查找上。为了只验证近邻搜索核心，本次使用已有独立 runner：
 
-### 3.5 构建集成
-
-`sltk_grid_parallel.cpp` 已在 `ENABLE_MPI` 时加入 `module_neighbor` 构建：
-
-```cmake
-if(ENABLE_MPI)
-  target_sources(neighbor PRIVATE sltk_grid_parallel.cpp)
-endif()
+```text
+source/source_cell/module_neighbor/test/sltk_material_runtime_runner.cpp
 ```
 
-串行或非 MPI 构建不会编译该文件，避免引入 MPI 依赖。
+测试体系仍采用四类材料：
 
-## 4. 与项目书 4.2 的对应关系
+| 体系 | 原子数 | 结构类型 |
+| --- | ---: | --- |
+| Al fcc | 1000 | 金属 |
+| Si diamond | 2000 | 半导体 |
+| NaCl | 3000 | 离子晶体 |
+| TiO2 rutile | 4200 | 复杂氧化物 |
 
-| 项目书要求 | 当前完成情况 |
+测试关注两件事：
+
+1. `avg_neighbors` 是否一致，确保优化没有改变邻居结果。
+2. `build_ms` 是否下降，衡量网格和邻接表构建耗时。
+
+## 5. 测试结果
+
+### 5.1 单线程：自适应剪枝 A/B
+
+单线程编译不启用 OpenMP。关闭自适应剪枝时使用：
+
+```text
+-DSLTK_DISABLE_ADAPTIVE_BOX_PRUNING
+```
+
+| 体系 | baseline build_ms | adaptive build_ms | 加速比 |
+| --- | ---: | ---: | ---: |
+| Al 1000 | 10.4496 | 2.3172 | 4.51x |
+| Si 2000 | 38.5710 | 6.5390 | 5.90x |
+| NaCl 3000 | 88.4995 | 13.9946 | 6.32x |
+| TiO2 4200 | 175.0070 | 24.0591 | 7.27x |
+
+四个体系的 `avg_neighbors` 完全一致，说明自适应剪枝没有改变近邻搜索结果。
+
+### 5.2 4 线程：自适应剪枝 + 静态调度
+
+编译加入：
+
+```text
+-fopenmp
+```
+
+运行时设置：
+
+```powershell
+$env:OMP_NUM_THREADS='4'
+```
+
+| 体系 | baseline build_ms | adaptive build_ms | 加速比 |
+| --- | ---: | ---: | ---: |
+| Al 1000 | 3.4369 | 1.6454 | 2.09x |
+| Si 2000 | 10.0478 | 3.0583 | 3.29x |
+| NaCl 3000 | 22.8761 | 5.7071 | 4.01x |
+| TiO2 4200 | 46.3795 | 9.9352 | 4.67x |
+
+### 5.3 4 线程：guided 调度动态负载均衡
+
+将 OpenMP 调度改为 `schedule(guided, 16)` 后，顺序运行得到：
+
+| 体系 | baseline build_ms | adaptive build_ms | 加速比 |
+| --- | ---: | ---: | ---: |
+| Al 1000 | 2.6884 | 1.5770 | 1.70x |
+| Si 2000 | 8.2800 | 2.6953 | 3.07x |
+| NaCl 3000 | 19.2133 | 5.2650 | 3.65x |
+| TiO2 4200 | 40.6054 | 8.2521 | 4.92x |
+
+和 static 版本相比，guided 调度在四个体系上都更快。这个结果说明线程之间确实存在一定工作量差异，动态领取任务能够减少尾部等待。
+
+## 6. 当前代码状态
+
+| 项目书方向 | 当前状态 |
 | --- | --- |
-| MPI 域分解沿三维空间进行 | 已在 `GridParallel` 中实现 |
-| 自动确定 `Px x Py x Pz` | 已实现，优先选择接近立方体的分解 |
-| 每个 MPI 进程负责一个子域 | 已实现 owned atom 子域归属 |
-| OpenMP 在线程内并行搜索 | 已并入 `Grid::Construct_Adjacent()` |
-| 每个线程独立搜索负责原子的近邻列表 | 已实现 |
-| 幽灵原子交换 | 已在 `GridParallel` 中实现 26 邻域交换 |
-| 最小化通信面 | 已按边界层筛选发送原子，仍可继续优化通信打包 |
+| 空间划分减少距离计算 | 已完成局部邻域搜索 |
+| OpenMP 线程并行 | 已并入 `Grid::Construct_Adjacent()` |
+| MPI 三维域分解 | 已在 `GridParallel` 中实现候选路径 |
+| ghost atom 交换 | 已在 `GridParallel` 中实现 26 邻域交换 |
+| 自适应搜索策略 | 已完成 per-box 包围盒剪枝 |
+| 动态负载均衡 | 已将 OpenMP 调度改为 `guided,16` |
 
-## 5. 当前限制
+## 7. 结论
 
-- `GridParallel` 已进入 MPI 构建，但尚未替换 ABACUS 所有调用路径；默认旧主路径主要使用邻域搜索和 OpenMP。
-- ghost atom 交换目前采用 26 邻域直接交换，代码清晰但通信打包仍有优化空间。
-- 尚未完成系统性能测试，需要用材料 benchmark 验证正确性、加速比和并行效率。
+这次优化的核心不是改变物理判定，也不是放宽搜索半径，而是把不必要的候选检查提前过滤掉。最终是否加入邻接表仍由 `dr <= sradius2` 决定，因此结果保持一致。
 
-## 6. 后续建议
+从测试看，自适应剪枝在单线程下已经有明显收益；4 线程下继续有效。动态负载均衡对较大体系更明显，TiO2 体系在 4 线程下从 static adaptive 的约 `9.94 ms` 降到 guided adaptive 的约 `8.25 ms`。这说明当前近邻搜索已经不只是“能并行”，而是开始处理线程间任务不均的问题。
 
-1. 增加单元测试：比较原全空间搜索和局部邻域搜索的邻居表是否一致。
-2. 增加 MPI 测试：验证 `GridParallel` 在 1、2、4、8 rank 下邻居数一致。
-3. 用 Al、Si、NaCl、TiO2 四类材料做性能测试，记录串行时间、OpenMP 时间、MPI+OpenMP 时间和加速比。
-4. 若要完全替换生产路径，再设计 `Grid_Driver` 或 `AtomArrange` 层面的并行入口开关。
+后续如果继续推进，建议重点放在两处：
+
+1. 给 `GridParallel` 增加正式 MPI benchmark，验证多 rank 下邻居数和串行结果一致。
+2. 把 runner 的内存统计补全到 `box_bounds`，当前表格沿用旧统计口径，主要用于时间对比。
