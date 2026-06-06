@@ -12,7 +12,7 @@ source/source_cell/module_neighbor/sltk_grid_parallel.*
 
 其中真正进入当前主搜索路径的是 `Grid` / `Grid_Driver`。`GridParallel` 是上一阶段留下的 MPI 空间域划分候选实现，本报告也一并说明，但这次主要提交的是 `Grid` 主路径里的自适应剪枝和 OpenMP 调度优化。
 
-整体思路很简单：不改近邻判定标准，只减少没必要检查的候选 box 和候选原子。最后是否加入邻接表，仍然由原来的距离条件决定：
+整体思路是：不改近邻判定标准，只减少没必要检查的候选 box 和候选原子。最后是否加入邻接表，仍然由原来的距离条件决定：
 
 ```cpp
 if (dr != 0.0 && dr <= this->sradius2)
@@ -311,17 +311,28 @@ std::vector<FAtom> ghost_atoms = exchange_ghost_atoms(owned_search_atoms, bounds
 rebuild_local_search_grid(owned_search_atoms, ghost_atoms);
 ```
 
-这一块目前作为 MPI 候选实现保留，还没有替换所有生产路径。后续如果继续推进，重点应该是给它补正式 MPI benchmark，比较 1/2/4/8 rank 的邻居表一致性。
+这次加入 `box_bounds` 后，MPI 局部网格重建也需要同步维护包围盒，否则局部搜索会拿不到候选 box 的边界信息。对应修正是让 `rebuild_local_search_grid()` 在重建 `atoms_in_box` 时同时清空、扩容并更新 `box_bounds`：
+
+```cpp
+atoms_in_box.clear();
+box_bounds.clear();
+atoms_in_box.resize(box_nx);
+box_bounds.resize(box_nx);
+
+auto add_atom = [this](const FAtom& atom) {
+    const int bx = atom_box_x(atom);
+    const int by = atom_box_y(atom);
+    const int bz = atom_box_z(atom);
+    atoms_in_box[bx][by][bz].push_back(atom);
+    box_bounds[bx][by][bz].add_atom(atom);
+};
+```
+
+这一块目前作为 MPI 候选实现保留，还没有替换所有生产路径；当前代码状态是并行局部网格和主路径使用同一套 `atoms_in_box` / `box_bounds` 数据约定。
 
 ## 8. 测试方式
 
-完整 ABACUS 顶层 CMake 会继续查找 FFTW3、BLAS、LAPACK、ScaLAPACK 等依赖。当前机器上 FFTW3 已通过 Conda 安装，CMake 可以找到：
-
-```text
-D:/Real_Softwares/anaconda/Library/lib/fftw3.lib
-```
-
-但顶层配置后续会卡在项目自带 `FindBLAS.cmake` / `FindLAPACK.cmake` 的递归查找上。为了只验证近邻搜索核心，本次使用已有独立 runner：
+为了只验证近邻搜索核心，本次使用已有独立 runner：
 
 ```text
 source/source_cell/module_neighbor/test/sltk_material_runtime_runner.cpp

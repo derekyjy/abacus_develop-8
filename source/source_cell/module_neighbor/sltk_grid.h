@@ -46,7 +46,7 @@ class Grid
     int box_ny=0;
     int box_nz=0;
 
-    void getBox(int& bx, int& by, int& bz, const double& x, const double& y, const double& z)
+    void getBox(int& bx, int& by, int& bz, const double& x, const double& y, const double& z) const
     {
         bx = std::floor((x - x_min) / box_edge_length);
         by = std::floor((y - y_min) / box_edge_length);
