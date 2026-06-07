@@ -4,7 +4,9 @@
 #include "sltk_grid.h"
 
 #include <mpi.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <chrono>
 #include <array>
 #include <vector>

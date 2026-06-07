@@ -329,13 +329,17 @@ void GridParallel::rebuild_local_search_grid(const std::vector<FAtom>& owned_ato
                                              const std::vector<FAtom>& ghost_atoms)
 {
     atoms_in_box.clear();
+    box_bounds.clear();
     atoms_in_box.resize(box_nx);
+    box_bounds.resize(box_nx);
     for (int i = 0; i < box_nx; i++)
     {
         atoms_in_box[i].resize(box_ny);
+        box_bounds[i].resize(box_ny);
         for (int j = 0; j < box_ny; j++)
         {
             atoms_in_box[i][j].resize(box_nz);
+            box_bounds[i][j].resize(box_nz);
         }
     }
 
@@ -344,6 +348,7 @@ void GridParallel::rebuild_local_search_grid(const std::vector<FAtom>& owned_ato
         const int by = atom_box_y(atom);
         const int bz = atom_box_z(atom);
         atoms_in_box[bx][by][bz].push_back(atom);
+        box_bounds[bx][by][bz].add_atom(atom);
     };
 
     for (const auto& atom : owned_atoms)
@@ -358,7 +363,7 @@ void GridParallel::rebuild_local_search_grid(const std::vector<FAtom>& owned_ato
 
 double GridParallel::Construct_Adjacent_serial(const UnitCell& ucell)
 {
-    double t_start = omp_get_wtime();
+    double t_start = MPI_Wtime();
 
     for (int i_type = 0; i_type < ucell.ntype; i_type++)
     {
@@ -374,7 +379,7 @@ double GridParallel::Construct_Adjacent_serial(const UnitCell& ucell)
         }
     }
 
-    double t_end = omp_get_wtime();
+    double t_end = MPI_Wtime();
     return t_end - t_start;
 }
 
@@ -443,9 +448,13 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
 
     int my_count = static_cast<int>(local_atoms.size());
 
+#ifdef _OPENMP
 #pragma omp parallel
+#endif
     {
+#ifdef _OPENMP
 #pragma omp for schedule(static)
+#endif
         for (int local_idx = 0; local_idx < my_count; local_idx++)
         {
             const int i_type = local_atoms[local_idx].first;
