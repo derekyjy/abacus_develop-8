@@ -4,10 +4,12 @@
 #include "source_base/timer.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <unordered_map>
 
 namespace
 {
@@ -704,16 +706,24 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
     std::swap(saved_atoms_in_box, atoms_in_box);
     std::swap(saved_box_bounds, box_bounds);
 
-    flat_atoms.clear();
+    // Build flat index map for O(1) lookup during deserialization
+    // Map key: packed (type, natom, cell_x, cell_y, cell_z) -> FAtom* in atoms_in_box
+    std::unordered_map<uint64_t, FAtom*> atom_map;
     for (int bx = 0; bx < box_nx; bx++)
     {
         for (int by = 0; by < box_ny; by++)
         {
             for (int bz = 0; bz < box_nz; bz++)
             {
-                for (const auto& atom : atoms_in_box[bx][by][bz])
+                for (auto& atom : atoms_in_box[bx][by][bz])
                 {
-                    flat_atoms.push_back(atom);
+                    // Pack 5 ints into uint64: type(16) | natom(20) | cx(10) | cy(9) | cz(9)
+                    uint64_t key = (static_cast<uint64_t>(atom.type & 0xFFFF) << 48)
+                                 | (static_cast<uint64_t>(atom.natom & 0xFFFFF) << 28)
+                                 | (static_cast<uint64_t>(atom.cell_x & 0x3FF) << 18)
+                                 | (static_cast<uint64_t>(atom.cell_y & 0x1FF) << 9)
+                                 | (static_cast<uint64_t>(atom.cell_z & 0x1FF));
+                    atom_map[key] = &atom;
                 }
             }
         }
@@ -728,28 +738,32 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
             for (int i = 0; i < count; i++)
             {
                 int num_entries = size_recv_buf[size_recv_displs[p] + i];
-                std::vector<NeighborEntry> entries;
-                entries.reserve(num_entries);
-                for (int e = 0; e < num_entries; e++)
-                {
-                    int entry_idx = total_idx * 8;
-                    NeighborEntry entry;
-                    entry.type = static_cast<int>(recv_buf[entry_idx]);
-                    entry.natom = static_cast<int>(recv_buf[entry_idx + 1]);
-                    entry.cell_x = static_cast<int>(recv_buf[entry_idx + 2]);
-                    entry.cell_y = static_cast<int>(recv_buf[entry_idx + 3]);
-                    entry.cell_z = static_cast<int>(recv_buf[entry_idx + 4]);
-                    entry.x = recv_buf[entry_idx + 5];
-                    entry.y = recv_buf[entry_idx + 6];
-                    entry.z = recv_buf[entry_idx + 7];
-                    entries.push_back(entry);
-                    total_idx++;
-                }
-
                 const int atom_id_offset = (size_recv_displs[p] + i) * 2;
                 const int i_type = atom_id_recv_buf[atom_id_offset];
                 const int j_atom = atom_id_recv_buf[atom_id_offset + 1];
-                deserialize_neighbors(i_type, j_atom, entries);
+
+                for (int e = 0; e < num_entries; e++)
+                {
+                    int entry_idx = (total_idx + e) * 8;
+                    int ntype   = static_cast<int>(recv_buf[entry_idx]);
+                    int nnatom  = static_cast<int>(recv_buf[entry_idx + 1]);
+                    int ncell_x = static_cast<int>(recv_buf[entry_idx + 2]);
+                    int ncell_y = static_cast<int>(recv_buf[entry_idx + 3]);
+                    int ncell_z = static_cast<int>(recv_buf[entry_idx + 4]);
+
+                    uint64_t key = (static_cast<uint64_t>(ntype & 0xFFFF) << 48)
+                                 | (static_cast<uint64_t>(nnatom & 0xFFFFF) << 28)
+                                 | (static_cast<uint64_t>(ncell_x & 0x3FF) << 18)
+                                 | (static_cast<uint64_t>(ncell_y & 0x1FF) << 9)
+                                 | (static_cast<uint64_t>(ncell_z & 0x1FF));
+
+                    auto it = atom_map.find(key);
+                    if (it != atom_map.end())
+                    {
+                        all_adj_info[i_type][j_atom].push_back(it->second);
+                    }
+                }
+                total_idx += num_entries;
             }
         }
     }
