@@ -23,3 +23,30 @@ AddTest(
   ../sltk_atom.cpp
   ../../../source_io/module_output/output.cpp
 )
+
+if(ENABLE_MPI)
+  add_executable(sltk_material_runtime_runner
+    sltk_material_runtime_runner.cpp
+    ../sltk_atom_arrange.cpp
+    ../sltk_grid_driver.cpp
+    ../sltk_grid.cpp
+    ../sltk_atom.cpp
+    ../sltk_grid_parallel.cpp
+    ../../../source_io/module_output/output.cpp
+  )
+  target_include_directories(sltk_material_runtime_runner PRIVATE
+    ${CMAKE_SOURCE_DIR}/source
+  )
+  target_link_libraries(sltk_material_runtime_runner PRIVATE
+    parameter ${math_libs} base device cell_info
+    MPI::MPI_CXX
+  )
+  if(USE_OPENMP)
+    target_link_libraries(sltk_material_runtime_runner PRIVATE
+      OpenMP::OpenMP_CXX
+    )
+  endif()
+  set_target_properties(sltk_material_runtime_runner PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
+  )
+endif()
