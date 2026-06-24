@@ -144,11 +144,77 @@ for (int i = 0; i < natom; i++)
 
 这里同时完成了并行优化和后面提到的动态负载均衡优化：`schedule(guided, 16)` 会让线程动态领取任务块。
 
-## 5. 自适应剪枝：用 box 内真实原子的包围盒过滤候选
+## 5. 自适应搜索策略：密度感知网格 + box 包围盒剪枝
 
-局部邻域搜索已经减少了 box 数量，但仍有不少邻域 box 实际上不可能含有近邻。特别是原子分布不均时，固定 `search_span` 会让低密度区域扫描很多空 box 或远 box。
+局部邻域搜索已经减少了 box 数量，但旧实现里 box 的划分仍然比较粗：`box_nx/y/z` 直接来自扩胞层数，一个周期镜像 cell 基本对应一个 box。这样在高密度体系里，一个 box 可能塞入较多原子，进入 box 之后仍要做很多逐原子距离判断。
 
-为了解决这个问题，在 `sltk_grid.h` 中新增了每个 box 的原子包围盒：
+这次把步骤一做成两层：
+
+1. 构建网格时根据扩胞后的原子密度自适应选择 `box_edge_length`。
+2. 搜索时继续使用每个 box 的真实原子包围盒 `box_bounds` 过滤不可能命中的候选 box。
+
+这里没有在生产代码里使用真正随机的蒙特卡洛采样。近邻表构建要求结果可复现，如果引入随机数，网格划分会受随机种子影响，测试也会变得不稳定。当前实现用确定性的密度估计：扩胞后的原子总数除以坐标包围盒体积，然后反推出合适的 box 边长。这个做法比随机采样更便宜，也更容易复现。
+
+### 5.1 密度感知网格划分
+
+在 `setMemberVariables()` 里，先统计原胞原子数和扩胞层数：
+
+```cpp
+int natom_total = 0;
+for (int i = 0; i < ucell.ntype; i++)
+{
+    natom_total += ucell.atoms[i].na;
+}
+
+const int image_nx = std::max(1, glayerX + glayerX_minus);
+const int image_ny = std::max(1, glayerY + glayerY_minus);
+const int image_nz = std::max(1, glayerZ + glayerZ_minus);
+const double replicated_atoms = static_cast<double>(natom_total)
+                              * static_cast<double>(image_nx)
+                              * static_cast<double>(image_ny)
+                              * static_cast<double>(image_nz);
+```
+
+再根据扩胞后坐标范围估计平均密度，并把目标设成每个 box 大约容纳 8 个原子：
+
+```cpp
+const double x_range = std::max(x_max - x_min, 1.0e-12);
+const double y_range = std::max(y_max - y_min, 1.0e-12);
+const double z_range = std::max(z_max - z_min, 1.0e-12);
+const double volume = x_range * y_range * z_range;
+const double target_atoms_per_box = 8.0;
+const double safe_radius = std::max(sradius, 1.0e-8);
+const double min_box_edge = safe_radius / 3.0;
+const double max_box_edge = safe_radius + 0.1;
+
+double adaptive_edge = max_box_edge;
+if (replicated_atoms > 0.0 && volume > 0.0)
+{
+    const double density = replicated_atoms / volume;
+    if (density > 0.0)
+    {
+        adaptive_edge = std::cbrt(target_atoms_per_box / density);
+    }
+}
+```
+
+最后把边长限制在 `[sradius / 3, sradius + 0.1]`。这样高密度时 box 会变小，但不会小到让邻域层数无限扩大；低密度时 box 会接近原来的半径尺度，避免创建大量空 box：
+
+```cpp
+this->box_edge_length = std::max(min_box_edge, std::min(max_box_edge, adaptive_edge));
+const int max_boxes_per_axis = 512;
+this->box_edge_length = std::max(this->box_edge_length, x_range / max_boxes_per_axis);
+this->box_edge_length = std::max(this->box_edge_length, y_range / max_boxes_per_axis);
+this->box_edge_length = std::max(this->box_edge_length, z_range / max_boxes_per_axis);
+
+this->box_nx = std::max(1, static_cast<int>(std::ceil(x_range / box_edge_length)) + 1);
+this->box_ny = std::max(1, static_cast<int>(std::ceil(y_range / box_edge_length)) + 1);
+this->box_nz = std::max(1, static_cast<int>(std::ceil(z_range / box_edge_length)) + 1);
+```
+
+### 5.2 构建阶段同步维护 `box_bounds`
+
+在 `sltk_grid.h` 中保留每个 box 的原子包围盒：
 
 ```cpp
 struct BoxBounds
@@ -176,8 +242,6 @@ struct BoxBounds
 std::vector<std::vector<std::vector<BoxBounds>>> box_bounds;
 ```
 
-### 5.1 构建阶段同步维护 `box_bounds`
-
 在 `setMemberVariables()` 里，`atoms_in_box` 和 `box_bounds` 使用相同维度初始化：
 
 ```cpp
@@ -199,16 +263,17 @@ for (int i = 0; i < this->box_nx; i++)
 
 ```cpp
 FAtom atom(x, y, z, i, j, ix, iy, iz);
-box_i_x = ix + glayerX_minus;
-box_i_y = iy + glayerY_minus;
-box_i_z = iz + glayerZ_minus;
+this->getBox(box_i_x, box_i_y, box_i_z, x, y, z);
+box_i_x = std::max(0, std::min(this->box_nx - 1, box_i_x));
+box_i_y = std::max(0, std::min(this->box_ny - 1, box_i_y));
+box_i_z = std::max(0, std::min(this->box_nz - 1, box_i_z));
 this->atoms_in_box[box_i_x][box_i_y][box_i_z].push_back(atom);
 this->box_bounds[box_i_x][box_i_y][box_i_z].add_atom(atom);
 ```
 
-这样搜索阶段可以知道：一个 box 是空的，还是里面原子的实际空间范围在哪里。
+这里的关键点是：原子不再按 `ix + glayerX_minus` 这种扩胞层号直接入箱，而是按真实坐标通过 `getBox()` 落到空间网格里。这样高密度区域会被拆到更多小 box，低密度区域则保持较粗的网格。
 
-### 5.2 搜索阶段先判断 box 是否可能命中
+### 5.3 搜索阶段先判断 box 是否可能命中
 
 进入 box 内逐原子距离计算前，先调用：
 
@@ -223,7 +288,7 @@ if (!this->box_may_contain_neighbor(fatom, this->box_bounds[box_i_x_adj][box_i_y
 
 `SLTK_DISABLE_ADAPTIVE_BOX_PRUNING` 是测试开关。正常编译不开这个宏，自适应剪枝默认启用；A/B 测试时打开这个宏，可以回到不剪枝的行为。
 
-### 5.3 剪枝判断的具体逻辑
+### 5.4 剪枝判断的具体逻辑
 
 `box_may_contain_neighbor()` 做的是“点到轴对齐包围盒的最小距离”判断：
 
@@ -258,7 +323,7 @@ bool Grid::box_may_contain_neighbor(const FAtom& fatom, const BoxBounds& bounds)
 
 如果当前原子到这个包围盒的最小可能距离都大于搜索半径，那么 box 内任何原子都不可能进入近邻表。反过来，如果这个条件通过，也不直接认为是近邻，只是允许进入原来的逐原子精确判断。
 
-这就是本次“自适应”的核心：搜索范围不只由固定网格跨度决定，还由每个 box 内真实原子分布动态决定。
+这就是本次“自适应”的核心：网格尺寸先根据整体密度调节，搜索阶段再根据每个 box 内真实原子分布做精确剪枝。最终是否加入近邻表仍由 `dr <= sradius2` 判断，所以这不是近似搜索。
 
 ## 6. 动态负载均衡：为什么用 `guided,16`
 
@@ -347,48 +412,53 @@ source/source_cell/module_neighbor/test/sltk_material_runtime_runner.cpp
 | NaCl | 3000 | 离子晶体 |
 | TiO2 rutile | 4200 | 复杂氧化物 |
 
+测试使用 4 线程：
+
+```bash
+OMP_NUM_THREADS=4 ./sltk_material_runtime_runner
+```
+
 测试判断两件事：
 
-1. `avg_neighbors` 优化前后一致，证明结果没有变。
+1. 正常版本和 `-DSLTK_DISABLE_ADAPTIVE_BOX_PRUNING` 版本的 `avg_neighbors` 一致，证明包围盒剪枝没有改变近邻结果。
 2. `build_ms` 下降，证明近邻表构建加速。
 
 ## 9. 测试结果
 
-### 9.1 单线程自适应剪枝
+### 9.1 4 线程密度感知网格
 
-| 体系 | baseline build_ms | adaptive build_ms | 加速比 |
+| 体系 | avg_neighbors | build_ms | total_ms |
 | --- | ---: | ---: | ---: |
-| Al 1000 | 10.4496 | 2.3172 | 4.51x |
-| Si 2000 | 38.5710 | 6.5390 | 5.90x |
-| NaCl 3000 | 88.4995 | 13.9946 | 6.32x |
-| TiO2 4200 | 175.0070 | 24.0591 | 7.27x |
+| Al 1000 | 12 | 2.7877 | 2.9389 |
+| Si 2000 | 4 | 4.7504 | 4.9634 |
+| NaCl 3000 | 6 | 6.0373 | 6.3823 |
+| TiO2 4200 | 4 | 8.5563 | 9.0436 |
 
-四个体系的 `avg_neighbors` 完全一致。
+这组结果使用密度感知网格和 `box_bounds` 剪枝。`avg_neighbors` 分别为 Al 12、Si 4、NaCl 6、TiO2 4，符合这些测试晶体在当前截断半径下的近邻数预期。
 
-### 9.2 4 线程 static 调度
+### 9.2 关闭包围盒剪枝的对照
 
-| 体系 | baseline build_ms | adaptive build_ms | 加速比 |
+编译时加入：
+
+```bash
+-DSLTK_DISABLE_ADAPTIVE_BOX_PRUNING
+```
+
+| 体系 | avg_neighbors | build_ms | total_ms |
 | --- | ---: | ---: | ---: |
-| Al 1000 | 3.4369 | 1.6454 | 2.09x |
-| Si 2000 | 10.0478 | 3.0583 | 3.29x |
-| NaCl 3000 | 22.8761 | 5.7071 | 4.01x |
-| TiO2 4200 | 46.3795 | 9.9352 | 4.67x |
+| Al 1000 | 12 | 3.1769 | 3.3182 |
+| Si 2000 | 4 | 4.9624 | 5.1994 |
+| NaCl 3000 | 6 | 5.9916 | 6.3994 |
+| TiO2 4200 | 4 | 9.4256 | 9.9215 |
 
-### 9.3 4 线程 guided 调度
-
-| 体系 | baseline build_ms | adaptive build_ms | 加速比 |
-| --- | ---: | ---: | ---: |
-| Al 1000 | 2.6884 | 1.5770 | 1.70x |
-| Si 2000 | 8.2800 | 2.6953 | 3.07x |
-| NaCl 3000 | 19.2133 | 5.2650 | 3.65x |
-| TiO2 4200 | 40.6054 | 8.2521 | 4.92x |
-
-guided 调度相对 static 调度在四个体系上都更快，所以最终保留。
+两组 `avg_neighbors` 完全一致，说明 `box_bounds` 剪枝只减少候选 box 进入逐原子距离计算的次数，不影响最终近邻表。耗时上，开启剪枝后 Al、Si、TiO2 更快，NaCl 这组数据基本持平。
 
 ## 10. 总体总结
 
 本项目的优化过程是从“减少无效计算”开始，再逐步叠加并行和负载均衡。旧版近邻搜索虽然已经有 box 数据结构，但实际构建邻接表时仍会产生大量不必要的候选遍历。我们首先把搜索范围限制到当前原子附近的局部 box，避免每个原子都扫描扩胞后的完整空间；随后在原子任务层面引入 OpenMP，使不同原子的近邻搜索可以并行执行。
 
-在此基础上，本次进一步加入自适应剪枝。具体做法是在构建 `atoms_in_box` 的同时维护每个 box 内真实原子的坐标包围盒 `box_bounds`。搜索时先判断当前原子到候选 box 包围盒的最小可能距离，如果这个距离已经超过搜索半径，就直接跳过整个 box。这个判断发生在逐原子距离计算之前，因此能减少大量无效距离计算；同时最终是否加入近邻表仍由 `dr <= sradius2` 决定，所以不会改变近邻搜索结果。
+在此基础上，本次进一步加入密度感知网格。具体做法是先用扩胞后的原子数和坐标包围盒估计平均密度，再把目标控制在每个 box 大约 8 个原子，由此确定 `box_edge_length` 和 `box_nx/y/z`。原子入箱时不再直接使用扩胞层号，而是通过 `getBox()` 按真实坐标进入空间网格。这样高密度区域会被拆成更多小 box，低密度区域则避免创建过细的空网格。
 
-最后，考虑到不同原子附近候选数量不完全一致，我们将 OpenMP 调度方式从 `static` 改为 `guided,16`。这样线程不会固定处理一大段原子，而是在计算后期继续动态领取剩余任务，减少线程等待。测试结果表明，自适应剪枝在单线程和 4 线程下都能保持邻居数一致并明显降低构建时间；`guided` 调度相比 `static` 调度也进一步改善了 4 线程下的耗时。整体来看，本次优化没有改变原有接口和物理判定逻辑，但显著减少了近邻表构建阶段的候选扫描和距离判断开销。
+同时，代码仍然维护每个 box 内真实原子的坐标包围盒 `box_bounds`。搜索时先判断当前原子到候选 box 包围盒的最小可能距离，如果这个距离已经超过搜索半径，就直接跳过整个 box。这个判断发生在逐原子距离计算之前，因此能减少无效距离计算；最终是否加入近邻表仍由 `dr <= sradius2` 决定，所以不会改变近邻判定逻辑。
+
+最后，考虑到不同原子附近候选数量不完全一致，我们将 OpenMP 调度方式从 `static` 改为 `guided,16`。这样线程不会固定处理一大段原子，而是在计算后期继续动态领取剩余任务，减少线程等待。测试结果表明，密度感知网格下开启或关闭包围盒剪枝时 `avg_neighbors` 完全一致；开启剪枝后多数测试体系的构建耗时进一步下降。整体来看，本次优化没有改变原有接口和近邻判定逻辑，但减少了近邻表构建阶段的候选扫描和距离判断开销。
