@@ -729,6 +729,15 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
         }
     }
 
+    // Clear local search results; deserialization rebuilds from allgathered data
+    for (int i_type = 0; i_type < ucell.ntype; i_type++)
+    {
+        for (int j_atom = 0; j_atom < ucell.atoms[i_type].na; j_atom++)
+        {
+            all_adj_info[i_type][j_atom].clear();
+        }
+    }
+
     // All ranks deserialize the complete result
     {
         int total_idx = 0;
