@@ -39,7 +39,13 @@ if(ENABLE_MPI)
   )
   target_link_libraries(sltk_material_runtime_runner PRIVATE
     parameter ${math_libs} base device cell_info
+    MPI::MPI_CXX
   )
+  if(USE_OPENMP)
+    target_link_libraries(sltk_material_runtime_runner PRIVATE
+      OpenMP::OpenMP_CXX
+    )
+  endif()
   set_target_properties(sltk_material_runtime_runner PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
   )
