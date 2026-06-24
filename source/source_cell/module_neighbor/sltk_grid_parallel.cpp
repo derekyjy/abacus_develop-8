@@ -361,6 +361,116 @@ void GridParallel::rebuild_local_search_grid(const std::vector<FAtom>& owned_ato
     }
 }
 
+GridParallel::DomainBounds GridParallel::rank_domain_bounds_balanced(
+    int rank,
+    const DomainDecomposition& decomp) const
+{
+    const int rx = rank % decomp.px;
+    const int ry = (rank / decomp.px) % decomp.py;
+    const int rz = rank / (decomp.px * decomp.py);
+
+    // Compute workload per box-slice along x direction
+    std::vector<int> x_workload(box_nx, 0);
+    for (int bx = 0; bx < box_nx; bx++)
+    {
+        for (int by = 0; by < box_ny; by++)
+        {
+            for (int bz = 0; bz < box_nz; bz++)
+            {
+                x_workload[bx] += static_cast<int>(atoms_in_box[bx][by][bz].size());
+            }
+        }
+    }
+
+    // Cumulative sum
+    std::vector<int> cumsum(box_nx + 1, 0);
+    for (int i = 0; i < box_nx; i++)
+    {
+        cumsum[i + 1] = cumsum[i] + x_workload[i];
+    }
+    const int total_work = cumsum[box_nx];
+    const int work_per_rank = std::max(1, total_work / decomp.px);
+
+    // Find x-range boundaries by workload
+    const auto find_split = [&](int target) {
+        if (target <= 0)
+        {
+            return 0;
+        }
+        if (target >= total_work)
+        {
+            return box_nx;
+        }
+        for (int i = 0; i < box_nx; i++)
+        {
+            if (cumsum[i + 1] > target)
+            {
+                return i + 1;
+            }
+        }
+        return box_nx;
+    };
+
+    const int x_begin = (rx == 0) ? 0 : find_split(rx * work_per_rank);
+    const int x_end = (rx == decomp.px - 1) ? box_nx : find_split((rx + 1) * work_per_rank);
+
+    // Ensure minimum domain width to avoid empty domains
+    const int x_width = std::max(x_end - x_begin, 1);
+    const int x_end_fixed = std::min(x_begin + x_width, box_nx);
+
+    // Within x-range, split y-range by box count (uniform decomposition)
+    const auto split_begin = [](int n, int p, int coord) {
+        return coord * (n / p) + std::min(coord, n % p);
+    };
+    const auto split_end = [&](int n, int p, int coord) {
+        return split_begin(n, p, coord + 1);
+    };
+
+    const int y_begin = split_begin(box_ny, decomp.py, ry);
+    const int y_end = split_end(box_ny, decomp.py, ry);
+    const int z_begin = split_begin(box_nz, decomp.pz, rz);
+    const int z_end = split_end(box_nz, decomp.pz, rz);
+
+    return {x_begin, x_end_fixed, y_begin, y_end, z_begin, z_end};
+}
+
+int GridParallel::estimate_atom_workload(const FAtom& atom) const
+{
+    int bx = 0;
+    int by = 0;
+    int bz = 0;
+    getBox(bx, by, bz, atom.x, atom.y, atom.z);
+    bx = std::max(0, std::min(box_nx - 1, bx));
+    by = std::max(0, std::min(box_ny - 1, by));
+    bz = std::max(0, std::min(box_nz - 1, bz));
+
+    if (box_edge_length <= 0.0)
+    {
+        return 1;
+    }
+
+    const int search_span = std::max(1, static_cast<int>(std::ceil(sradius / box_edge_length)));
+    const int x_begin = std::max(0, bx - search_span);
+    const int x_end = std::min(box_nx - 1, bx + search_span);
+    const int y_begin = std::max(0, by - search_span);
+    const int y_end = std::min(box_ny - 1, by + search_span);
+    const int z_begin = std::max(0, bz - search_span);
+    const int z_end = std::min(box_nz - 1, bz + search_span);
+
+    int count = 0;
+    for (int ix = x_begin; ix <= x_end; ix++)
+    {
+        for (int iy = y_begin; iy <= y_end; iy++)
+        {
+            for (int iz = z_begin; iz <= z_end; iz++)
+            {
+                count += static_cast<int>(atoms_in_box[ix][iy][iz].size());
+            }
+        }
+    }
+    return count;
+}
+
 double GridParallel::Construct_Adjacent_serial(const UnitCell& ucell)
 {
     double t_start = MPI_Wtime();
@@ -414,7 +524,7 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
     }
 
     const DomainDecomposition decomp = choose_domain_decomposition(size);
-    const DomainBounds bounds = rank_domain_bounds(rank, decomp);
+    const DomainBounds bounds = rank_domain_bounds_balanced(rank, decomp);
 
     std::vector<FAtom> owned_search_atoms;
     for (const auto& atom : flat_atoms)
@@ -426,9 +536,22 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
     }
 
     std::vector<FAtom> ghost_atoms = exchange_ghost_atoms(owned_search_atoms, bounds, decomp, comm);
+
+    std::vector<std::vector<std::vector<AtomMap>>> saved_atoms_in_box;
+    std::vector<std::vector<std::vector<BoxBounds>>> saved_box_bounds;
+    std::swap(saved_atoms_in_box, atoms_in_box);
+    std::swap(saved_box_bounds, box_bounds);
+
     rebuild_local_search_grid(owned_search_atoms, ghost_atoms);
 
-    std::vector<std::pair<int, int>> local_atoms;
+    struct LocalAtomTask
+    {
+        int i_type;
+        int j_atom;
+        int workload;
+    };
+
+    std::vector<LocalAtomTask> local_atoms;
     for (int i_type = 0; i_type < ucell.ntype; i_type++)
     {
         for (int j_atom = 0; j_atom < ucell.atoms[i_type].na; j_atom++)
@@ -441,10 +564,18 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
                        0, 0, 0);
             if (atom_in_domain(atom, bounds))
             {
-                local_atoms.push_back({i_type, j_atom});
+                const int workload = estimate_atom_workload(atom);
+                local_atoms.push_back({i_type, j_atom, workload});
             }
         }
     }
+
+    // Sort by workload descending: heavy atoms first
+    // Then schedule(static,1) interleaves them across threads
+    std::sort(local_atoms.begin(), local_atoms.end(),
+              [](const LocalAtomTask& a, const LocalAtomTask& b) {
+                  return a.workload > b.workload;
+              });
 
     int my_count = static_cast<int>(local_atoms.size());
 
@@ -453,12 +584,12 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
 #endif
     {
 #ifdef _OPENMP
-#pragma omp for schedule(static)
+#pragma omp for schedule(static, 1)
 #endif
         for (int local_idx = 0; local_idx < my_count; local_idx++)
         {
-            const int i_type = local_atoms[local_idx].first;
-            const int j_atom = local_atoms[local_idx].second;
+            const int i_type = local_atoms[local_idx].i_type;
+            const int j_atom = local_atoms[local_idx].j_atom;
 
             FAtom atom(ucell.atoms[i_type].tau[j_atom].x,
                        ucell.atoms[i_type].tau[j_atom].y,
@@ -475,8 +606,8 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
     std::vector<int> atom_id_buf(my_count * 2);
     for (int local_idx = 0; local_idx < my_count; local_idx++)
     {
-        const int i_type = local_atoms[local_idx].first;
-        const int j_atom = local_atoms[local_idx].second;
+        const int i_type = local_atoms[local_idx].i_type;
+        const int j_atom = local_atoms[local_idx].j_atom;
         atom_id_buf[local_idx * 2] = i_type;
         atom_id_buf[local_idx * 2 + 1] = j_atom;
         serialize_neighbors(i_type, j_atom, my_entries[local_idx]);
@@ -490,7 +621,7 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
     }
 
     int total_entries = 0;
-    MPI_Reduce(&send_count, &total_entries, 1, MPI_INT, MPI_SUM, 0, comm);
+    MPI_Allreduce(&send_count, &total_entries, 1, MPI_INT, MPI_SUM, comm);
 
     double* data_buf = new double[send_count * 8];
     int pos = 0;
@@ -509,104 +640,86 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
         }
     }
 
-    int* recv_counts = nullptr;
-    int* recv_displs = nullptr;
+    int* recv_counts = new int[size];
+    int* recv_displs = new int[size];
     double* recv_buf = nullptr;
 
-    if (rank == 0)
+    MPI_Allgather(&send_count, 1, MPI_INT, recv_counts, 1, MPI_INT, comm);
+
+    recv_displs[0] = 0;
+    for (int i = 1; i < size; i++)
     {
-        recv_counts = new int[size];
-        recv_displs = new int[size];
+        recv_displs[i] = recv_displs[i - 1] + recv_counts[i - 1];
     }
 
-    MPI_Gather(&send_count, 1, MPI_INT,
-               rank == 0 ? recv_counts : nullptr, 1, MPI_INT, 0, comm);
-
-    if (rank == 0)
+    int* recv_double_counts = new int[size];
+    int* recv_double_displs = new int[size];
+    for (int i = 0; i < size; i++)
     {
-        recv_displs[0] = 0;
-        for (int i = 1; i < size; i++)
-        {
-            recv_displs[i] = recv_displs[i - 1] + recv_counts[i - 1];
-        }
-        recv_buf = new double[total_entries * 8];
+        recv_double_counts[i] = recv_counts[i] * 8;
+        recv_double_displs[i] = recv_displs[i] * 8;
     }
 
-    int* recv_double_counts = nullptr;
-    int* recv_double_displs = nullptr;
-    if (rank == 0)
-    {
-        recv_double_counts = new int[size];
-        recv_double_displs = new int[size];
-        for (int i = 0; i < size; i++)
-        {
-            recv_double_counts[i] = recv_counts[i] * 8;
-            recv_double_displs[i] = recv_displs[i] * 8;
-        }
-    }
+    recv_buf = new double[total_entries * 8];
 
-    MPI_Gatherv(data_buf, send_count * 8, MPI_DOUBLE,
-                rank == 0 ? recv_buf : nullptr,
-                rank == 0 ? recv_double_counts : nullptr,
-                rank == 0 ? recv_double_displs : nullptr,
-                MPI_DOUBLE, 0, comm);
+    MPI_Allgatherv(data_buf, send_count * 8, MPI_DOUBLE,
+                   recv_buf, recv_double_counts, recv_double_displs,
+                   MPI_DOUBLE, comm);
 
     delete[] data_buf;
-    if (rank == 0)
+    delete[] recv_double_counts;
+    delete[] recv_double_displs;
+
+    int* size_recv_counts = new int[size];
+    int* size_recv_displs = new int[size];
+    int* atom_id_recv_counts = new int[size];
+    int* atom_id_recv_displs = new int[size];
+
+    MPI_Allgather(&my_count, 1, MPI_INT, size_recv_counts, 1, MPI_INT, comm);
+
+    size_recv_displs[0] = 0;
+    for (int i = 1; i < size; i++)
     {
-        delete[] recv_double_counts;
-        delete[] recv_double_displs;
+        size_recv_displs[i] = size_recv_displs[i - 1] + size_recv_counts[i - 1];
     }
-
-    int* size_recv_counts = nullptr;
-    int* size_recv_displs = nullptr;
-    int* size_recv_buf = nullptr;
-    int* atom_id_recv_counts = nullptr;
-    int* atom_id_recv_displs = nullptr;
-    int* atom_id_recv_buf = nullptr;
-
-    if (rank == 0)
+    int total_local_atoms = 0;
+    for (int i = 0; i < size; i++)
     {
-        size_recv_counts = new int[size];
-        size_recv_displs = new int[size];
-        atom_id_recv_counts = new int[size];
-        atom_id_recv_displs = new int[size];
+        total_local_atoms += size_recv_counts[i];
+        atom_id_recv_counts[i] = size_recv_counts[i] * 2;
+        atom_id_recv_displs[i] = size_recv_displs[i] * 2;
     }
+    int* size_recv_buf = new int[total_local_atoms];
+    int* atom_id_recv_buf = new int[total_local_atoms * 2];
 
-    MPI_Gather(&my_count, 1, MPI_INT,
-               rank == 0 ? size_recv_counts : nullptr, 1, MPI_INT, 0, comm);
+    MPI_Allgatherv(size_buf.data(), my_count, MPI_INT,
+                   size_recv_buf, size_recv_counts, size_recv_displs,
+                   MPI_INT, comm);
 
-    if (rank == 0)
+    MPI_Allgatherv(atom_id_buf.data(), my_count * 2, MPI_INT,
+                   atom_id_recv_buf, atom_id_recv_counts, atom_id_recv_displs,
+                   MPI_INT, comm);
+
+    // Restore full atoms_in_box for deserialization on all ranks
+    std::swap(saved_atoms_in_box, atoms_in_box);
+    std::swap(saved_box_bounds, box_bounds);
+
+    flat_atoms.clear();
+    for (int bx = 0; bx < box_nx; bx++)
     {
-        size_recv_displs[0] = 0;
-        for (int i = 1; i < size; i++)
+        for (int by = 0; by < box_ny; by++)
         {
-            size_recv_displs[i] = size_recv_displs[i - 1] + size_recv_counts[i - 1];
+            for (int bz = 0; bz < box_nz; bz++)
+            {
+                for (const auto& atom : atoms_in_box[bx][by][bz])
+                {
+                    flat_atoms.push_back(atom);
+                }
+            }
         }
-        int total_local_atoms = 0;
-        for (int i = 0; i < size; i++)
-        {
-            total_local_atoms += size_recv_counts[i];
-            atom_id_recv_counts[i] = size_recv_counts[i] * 2;
-            atom_id_recv_displs[i] = size_recv_displs[i] * 2;
-        }
-        size_recv_buf = new int[total_local_atoms];
-        atom_id_recv_buf = new int[total_local_atoms * 2];
     }
 
-    MPI_Gatherv(size_buf.data(), my_count, MPI_INT,
-                rank == 0 ? size_recv_buf : nullptr,
-                rank == 0 ? size_recv_counts : nullptr,
-                rank == 0 ? size_recv_displs : nullptr,
-                MPI_INT, 0, comm);
-
-    MPI_Gatherv(atom_id_buf.data(), my_count * 2, MPI_INT,
-                rank == 0 ? atom_id_recv_buf : nullptr,
-                rank == 0 ? atom_id_recv_counts : nullptr,
-                rank == 0 ? atom_id_recv_displs : nullptr,
-                MPI_INT, 0, comm);
-
-    if (rank == 0)
+    // All ranks deserialize the complete result
     {
         int total_idx = 0;
         for (int p = 0; p < size; p++)
@@ -639,17 +752,17 @@ double GridParallel::Construct_Adjacent_parallel(const UnitCell& ucell, MPI_Comm
                 deserialize_neighbors(i_type, j_atom, entries);
             }
         }
-
-        delete[] recv_counts;
-        delete[] recv_displs;
-        delete[] recv_buf;
-        delete[] size_recv_counts;
-        delete[] size_recv_displs;
-        delete[] size_recv_buf;
-        delete[] atom_id_recv_counts;
-        delete[] atom_id_recv_displs;
-        delete[] atom_id_recv_buf;
     }
+
+    delete[] recv_counts;
+    delete[] recv_displs;
+    delete[] recv_buf;
+    delete[] size_recv_counts;
+    delete[] size_recv_displs;
+    delete[] size_recv_buf;
+    delete[] atom_id_recv_counts;
+    delete[] atom_id_recv_displs;
+    delete[] atom_id_recv_buf;
 
     double t_end = MPI_Wtime();
 

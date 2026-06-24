@@ -4,8 +4,10 @@
 #include "source_io/module_parameter/parameter.h"
 #include "sltk_grid.h"
 #include "sltk_grid_driver.h"
+#ifdef __MPI
+#include "sltk_grid_parallel.h"
+#endif
 
-// update the followig class in near future
 #include "source_cell/unitcell.h"
 
 atom_arrange::atom_arrange()
@@ -90,9 +92,29 @@ void atom_arrange::search(const bool pbc_flag,
     */
     const double radius_lat0unit = search_radius_bohr / ucell.lat0;
 
-    // Atom_input at(ofs_in, ucell, pbc_flag, radius_lat0unit, test_atom_in);
-
+    // Always init grid_d to set all scalar members (glayer, box_nx, sradius, etc.)
     grid_d.init(ofs_in, ucell, radius_lat0unit, pbc_flag);
+
+#ifdef __MPI
+    // Overwrite with MPI-parallel results when MPI is available
+    {
+        int mpi_initialized = 0;
+        MPI_Initialized(&mpi_initialized);
+        if (mpi_initialized)
+        {
+            GridParallel grid_parallel;
+            grid_parallel.init(ofs_in, ucell, radius_lat0unit, pbc_flag);
+            grid_parallel.Construct_Adjacent_parallel(ucell, MPI_COMM_WORLD);
+
+            // Transfer array members to grid_d
+            // FAtom* pointers in all_adj_info remain valid because
+            // atoms_in_box is moved together
+            grid_d.all_adj_info = std::move(grid_parallel.all_adj_info);
+            grid_d.atoms_in_box = std::move(grid_parallel.atoms_in_box);
+            grid_d.box_bounds = std::move(grid_parallel.box_bounds);
+        }
+    }
+#endif
 
 	// The screen output is very time-consuming. To avoid interfering with the timing, we will insert logging here earlier.
     ModuleBase::timer::end("atom_arrange", "search");

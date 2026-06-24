@@ -47,7 +47,11 @@ class GridParallel : public Grid
 
     DomainDecomposition choose_domain_decomposition(int mpi_size) const;
 
+    DomainBounds rank_domain_bounds_balanced(int rank, const DomainDecomposition& decomp) const;
+
     DomainBounds rank_domain_bounds(int rank, const DomainDecomposition& decomp) const;
+
+    int estimate_atom_workload(const FAtom& atom) const;
 
     bool atom_in_domain(const FAtom& atom, const DomainBounds& bounds);
 
