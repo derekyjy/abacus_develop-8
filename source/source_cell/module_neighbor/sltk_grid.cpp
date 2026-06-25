@@ -207,27 +207,48 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
     ModuleBase::GlobalFunc::OUT(ofs_in, "Min coordinates of atoms", x_min, y_min, z_min);
     ModuleBase::GlobalFunc::OUT(ofs_in, "Max coordinates of atoms", x_max, y_max, z_max);
 
-    this->box_edge_length = sradius + 0.1; // To avoid edge cases, the size of the box is slightly increased.
-
-/*  warning box algorithm   
-    this->box_nx = std::ceil((this->x_max - this->x_min) / box_edge_length) + 1;
-    this->box_ny = std::ceil((this->y_max - this->y_min) / box_edge_length) + 1;
-    this->box_nz = std::ceil((this->z_max - this->z_min) / box_edge_length) + 1;
-    ModuleBase::GlobalFunc::OUT(ofs_in, "BoxNumber", box_nx, box_ny, box_nz);
-
-    atoms_in_box.resize(this->box_nx);
-    for (int i = 0; i < this->box_nx; i++)
+    int natom_total = 0;
+    for (int i = 0; i < ucell.ntype; i++)
     {
-        atoms_in_box[i].resize(this->box_ny);
-        for (int j = 0; j < this->box_ny; j++)
+        natom_total += ucell.atoms[i].na;
+    }
+
+    const int image_nx = std::max(1, glayerX + glayerX_minus);
+    const int image_ny = std::max(1, glayerY + glayerY_minus);
+    const int image_nz = std::max(1, glayerZ + glayerZ_minus);
+    const double replicated_atoms = static_cast<double>(natom_total)
+                                  * static_cast<double>(image_nx)
+                                  * static_cast<double>(image_ny)
+                                  * static_cast<double>(image_nz);
+    const double x_range = std::max(x_max - x_min, 1.0e-12);
+    const double y_range = std::max(y_max - y_min, 1.0e-12);
+    const double z_range = std::max(z_max - z_min, 1.0e-12);
+    const double volume = x_range * y_range * z_range;
+    const double target_atoms_per_box = 8.0;
+    const double safe_radius = std::max(sradius, 1.0e-8);
+    const double min_box_edge = safe_radius / 3.0;
+    const double max_box_edge = safe_radius + 0.1;
+
+    double adaptive_edge = max_box_edge;
+    if (replicated_atoms > 0.0 && volume > 0.0)
+    {
+        const double density = replicated_atoms / volume;
+        if (density > 0.0)
         {
-            atoms_in_box[i][j].resize(this->box_nz);
+            adaptive_edge = std::cbrt(target_atoms_per_box / density);
         }
     }
- */
-    this->box_nx = glayerX + glayerX_minus;
-    this->box_ny = glayerY + glayerY_minus;
-    this->box_nz = glayerZ + glayerZ_minus;
+
+    this->box_edge_length = std::max(min_box_edge, std::min(max_box_edge, adaptive_edge));
+    const int max_boxes_per_axis = 512;
+    this->box_edge_length = std::max(this->box_edge_length, x_range / max_boxes_per_axis);
+    this->box_edge_length = std::max(this->box_edge_length, y_range / max_boxes_per_axis);
+    this->box_edge_length = std::max(this->box_edge_length, z_range / max_boxes_per_axis);
+
+    this->box_nx = std::max(1, static_cast<int>(std::ceil(x_range / box_edge_length)) + 1);
+    this->box_ny = std::max(1, static_cast<int>(std::ceil(y_range / box_edge_length)) + 1);
+    this->box_nz = std::max(1, static_cast<int>(std::ceil(z_range / box_edge_length)) + 1);
+    ModuleBase::GlobalFunc::OUT(ofs_in, "Adaptive box edge length", box_edge_length);
     ModuleBase::GlobalFunc::OUT(ofs_in, "Number of needed cells", box_nx, box_ny, box_nz);
 
     atoms_in_box.resize(this->box_nx);
@@ -257,10 +278,10 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
                         double z = ucell.atoms[i].tau[j].z + vec1[2] * ix + vec2[2] * iy + vec3[2] * iz;
                         FAtom atom(x, y, z, i, j, ix, iy, iz);
                         int box_i_x, box_i_y, box_i_z;
-                        //this->getBox(box_i_x, box_i_y, box_i_z, x, y, z);
-                        box_i_x = ix + glayerX_minus;
-                        box_i_y = iy + glayerY_minus;
-                        box_i_z = iz + glayerZ_minus;
+                        this->getBox(box_i_x, box_i_y, box_i_z, x, y, z);
+                        box_i_x = std::max(0, std::min(this->box_nx - 1, box_i_x));
+                        box_i_y = std::max(0, std::min(this->box_ny - 1, box_i_y));
+                        box_i_z = std::max(0, std::min(this->box_nz - 1, box_i_z));
                         this->atoms_in_box[box_i_x][box_i_y][box_i_z].push_back(atom);
                         this->box_bounds[box_i_x][box_i_y][box_i_z].add_atom(atom);
                     }
@@ -317,11 +338,11 @@ void Grid::Construct_Adjacent_near_box(const FAtom& fatom)
     int box_i_z=0;
     this->getBox(box_i_x, box_i_y, box_i_z, fatom.x, fatom.y, fatom.z);
 
-    for (int box_i_x_adj = 0; box_i_x_adj < glayerX + glayerX_minus; box_i_x_adj++)
+    for (int box_i_x_adj = 0; box_i_x_adj < box_nx; box_i_x_adj++)
     {
-        for (int box_i_y_adj = 0; box_i_y_adj < glayerY + glayerY_minus; box_i_y_adj++)
+        for (int box_i_y_adj = 0; box_i_y_adj < box_ny; box_i_y_adj++)
         {
-            for (int box_i_z_adj = 0; box_i_z_adj < glayerZ + glayerZ_minus; box_i_z_adj++)
+            for (int box_i_z_adj = 0; box_i_z_adj < box_nz; box_i_z_adj++)
             {
 #ifndef SLTK_DISABLE_ADAPTIVE_BOX_PRUNING
                 if (!this->box_may_contain_neighbor(fatom, this->box_bounds[box_i_x_adj][box_i_y_adj][box_i_z_adj]))
