@@ -11,6 +11,72 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <tuple>
+#include <unordered_map>
+
+namespace
+{
+struct AtomImageKey
+{
+    int type = 0;
+    int natom = 0;
+    int cell_x = 0;
+    int cell_y = 0;
+    int cell_z = 0;
+
+    AtomImageKey() = default;
+    AtomImageKey(const int type_in,
+                 const int natom_in,
+                 const int cell_x_in,
+                 const int cell_y_in,
+                 const int cell_z_in)
+        : type(type_in),
+          natom(natom_in),
+          cell_x(cell_x_in),
+          cell_y(cell_y_in),
+          cell_z(cell_z_in)
+    {
+    }
+
+    bool operator==(const AtomImageKey& other) const
+    {
+        return type == other.type && natom == other.natom
+               && cell_x == other.cell_x && cell_y == other.cell_y
+               && cell_z == other.cell_z;
+    }
+};
+
+struct AtomImageKeyHash
+{
+    size_t operator()(const AtomImageKey& key) const
+    {
+        size_t seed = 1469598103934665603ull;
+        const auto mix = [&seed](const int value) {
+            seed ^= static_cast<size_t>(value + 0x9e3779b9);
+            seed *= 1099511628211ull;
+        };
+        mix(key.type);
+        mix(key.natom);
+        mix(key.cell_x);
+        mix(key.cell_y);
+        mix(key.cell_z);
+        return seed;
+    }
+};
+
+struct PendingNeighbor
+{
+    int type = 0;
+    int natom = 0;
+    FAtom* atom = nullptr;
+
+    PendingNeighbor() = default;
+    PendingNeighbor(const int type_in, const int natom_in, FAtom* atom_in)
+        : type(type_in), natom(natom_in), atom(atom_in)
+    {
+    }
+};
+} // namespace
 
 Grid::Grid(const int& test_grid_in) : test_grid(test_grid_in)
 {
@@ -158,54 +224,9 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
 
     this->clear_atoms();
 
-    // random selection, in order to estimate again.
-    for (int it = 0; it < ucell.ntype; it++)
-    {
-        if (ucell.atoms[it].na > 0)
-        {
-            this->x_min = ucell.atoms[it].tau[0].x;
-            this->y_min = ucell.atoms[it].tau[0].y;
-            this->z_min = ucell.atoms[it].tau[0].z;
-            this->x_max = ucell.atoms[it].tau[0].x;
-            this->y_max = ucell.atoms[it].tau[0].y;
-            this->z_max = ucell.atoms[it].tau[0].z;
-            break;
-        }
-    }
-
     ModuleBase::Vector3<double> vec1(ucell.latvec.e11, ucell.latvec.e12, ucell.latvec.e13);
     ModuleBase::Vector3<double> vec2(ucell.latvec.e21, ucell.latvec.e22, ucell.latvec.e23);
     ModuleBase::Vector3<double> vec3(ucell.latvec.e31, ucell.latvec.e32, ucell.latvec.e33);
-
-    // calculate min & max value
-    for (int ix = -glayerX_minus; ix < glayerX; ix++)
-    {
-        for (int iy = -glayerY_minus; iy < glayerY; iy++)
-        {
-            for (int iz = -glayerZ_minus; iz < glayerZ; iz++)
-            {
-                for (int i = 0; i < ucell.ntype; i++)
-                {
-                    for (int j = 0; j < ucell.atoms[i].na; j++)
-                    {
-                        double x = ucell.atoms[i].tau[j].x + vec1[0] * ix + vec2[0] * iy + vec3[0] * iz;
-                        double y = ucell.atoms[i].tau[j].y + vec1[1] * ix + vec2[1] * iy + vec3[1] * iz;
-                        double z = ucell.atoms[i].tau[j].z + vec1[2] * ix + vec2[2] * iy + vec3[2] * iz;
-                        x_min = std::min(x_min, x);
-                        x_max = std::max(x_max, x);
-                        y_min = std::min(y_min, y);
-                        y_max = std::max(y_max, y);
-                        z_min = std::min(z_min, z);
-                        z_max = std::max(z_max, z);
-                    }
-                }
-            }
-        }
-    }
-
-//    ofs_in << " RANGE OF ATOMIC COORDINATES (unit: lat0)" << std::endl;
-    ModuleBase::GlobalFunc::OUT(ofs_in, "Min coordinates of atoms", x_min, y_min, z_min);
-    ModuleBase::GlobalFunc::OUT(ofs_in, "Max coordinates of atoms", x_max, y_max, z_max);
 
     int natom_total = 0;
     for (int i = 0; i < ucell.ntype; i++)
@@ -249,7 +270,8 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
     this->box_ny = std::max(1, static_cast<int>(std::ceil(y_range / box_edge_length)) + 1);
     this->box_nz = std::max(1, static_cast<int>(std::ceil(z_range / box_edge_length)) + 1);
     ModuleBase::GlobalFunc::OUT(ofs_in, "Adaptive box edge length", box_edge_length);
-    ModuleBase::GlobalFunc::OUT(ofs_in, "Number of needed cells", box_nx, box_ny, box_nz);
+
+    bool has_atom = false;
 
     atoms_in_box.resize(this->box_nx);
     box_bounds.resize(this->box_nx);
@@ -277,6 +299,22 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
                         double y = ucell.atoms[i].tau[j].y + vec1[1] * ix + vec2[1] * iy + vec3[1] * iz;
                         double z = ucell.atoms[i].tau[j].z + vec1[2] * ix + vec2[2] * iy + vec3[2] * iz;
                         FAtom atom(x, y, z, i, j, ix, iy, iz);
+                        if (!has_atom)
+                        {
+                            x_min = x_max = x;
+                            y_min = y_max = y;
+                            z_min = z_max = z;
+                            has_atom = true;
+                        }
+                        else
+                        {
+                            x_min = std::min(x_min, x);
+                            x_max = std::max(x_max, x);
+                            y_min = std::min(y_min, y);
+                            y_max = std::max(y_max, y);
+                            z_min = std::min(z_min, z);
+                            z_max = std::max(z_max, z);
+                        }
                         int box_i_x, box_i_y, box_i_z;
                         this->getBox(box_i_x, box_i_y, box_i_z, x, y, z);
                         box_i_x = std::max(0, std::min(this->box_nx - 1, box_i_x));
@@ -289,6 +327,11 @@ void Grid::setMemberVariables(std::ofstream& ofs_in, //  output data to ofs
             }
         }
     }
+
+//    ofs_in << " RANGE OF ATOMIC COORDINATES (unit: lat0)" << std::endl;
+    ModuleBase::GlobalFunc::OUT(ofs_in, "Min coordinates of atoms", x_min, y_min, z_min);
+    ModuleBase::GlobalFunc::OUT(ofs_in, "Max coordinates of atoms", x_max, y_max, z_max);
+    ModuleBase::GlobalFunc::OUT(ofs_in, "Number of needed cells", box_nx, box_ny, box_nz);
     
     this->all_adj_info.resize(ucell.ntype);
     for (int i = 0; i < ucell.ntype; i++)
@@ -301,32 +344,178 @@ void Grid::Construct_Adjacent(const UnitCell& ucell)
 {
     ModuleBase::timer::start("Grid", "constru_adj");
 
-    std::vector<std::pair<int, int>> atom_pairs;
+    std::vector<int> type_offsets(ucell.ntype + 1, 0);
+    for (int i_type = 0; i_type < ucell.ntype; i_type++)
+    {
+        type_offsets[i_type + 1] = type_offsets[i_type] + ucell.atoms[i_type].na;
+    }
+
+    const auto flat_atom_id = [&type_offsets](const int type, const int natom) {
+        return type_offsets[type] + natom;
+    };
+
+    const size_t image_box_count = static_cast<size_t>(std::max(1, box_nx))
+                                 * static_cast<size_t>(std::max(1, box_ny))
+                                 * static_cast<size_t>(std::max(1, box_nz));
+    std::unordered_map<AtomImageKey, FAtom*, AtomImageKeyHash> atom_image_index;
+    atom_image_index.reserve(static_cast<size_t>(std::max(1, type_offsets.back())) * image_box_count);
+    for (auto& boxes_yz : atoms_in_box)
+    {
+        for (auto& boxes_z : boxes_yz)
+        {
+            for (auto& atoms : boxes_z)
+            {
+                for (auto& atom : atoms)
+                {
+                    atom_image_index[AtomImageKey(atom.type,
+                                                 atom.natom,
+                                                 atom.cell_x,
+                                                 atom.cell_y,
+                                                 atom.cell_z)] = &atom;
+                }
+            }
+        }
+    }
+
+    std::vector<FAtom> atom_pairs;
+    atom_pairs.reserve(static_cast<size_t>(type_offsets.back()));
     for (int i_type = 0; i_type < ucell.ntype; i_type++)
     {
         for (int j_atom = 0; j_atom < ucell.atoms[i_type].na; j_atom++)
         {
-            atom_pairs.push_back({i_type, j_atom});
+            atom_pairs.emplace_back(ucell.atoms[i_type].tau[j_atom].x,
+                                    ucell.atoms[i_type].tau[j_atom].y,
+                                    ucell.atoms[i_type].tau[j_atom].z,
+                                    i_type,
+                                    j_atom,
+                                    0,
+                                    0,
+                                    0);
         }
     }
 
-    const int natom = static_cast<int>(atom_pairs.size());
+    const int search_span = box_edge_length > 0.0
+                                ? std::max(1, static_cast<int>(std::ceil(sradius / box_edge_length)))
+                                : 1;
+    const auto& atom_image_lookup = atom_image_index;
+    int nthread = 1;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(guided, 16)
+    nthread = std::max(1, omp_get_max_threads());
 #endif
-    for (int i = 0; i < natom; i++)
-    {
-        const int i_type = atom_pairs[i].first;
-        const int j_atom = atom_pairs[i].second;
-        FAtom atom(ucell.atoms[i_type].tau[j_atom].x,
-                   ucell.atoms[i_type].tau[j_atom].y,
-                   ucell.atoms[i_type].tau[j_atom].z,
-                   i_type,
-                   j_atom,
-                   0, 0 ,0);
+    std::vector<std::vector<PendingNeighbor>> thread_neighbors(nthread);
 
-        this->Construct_Adjacent_near_box_local(atom);
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+    {
+        int thread_id = 0;
+#ifdef _OPENMP
+        thread_id = omp_get_thread_num();
+#endif
+        auto& pending = thread_neighbors[thread_id];
+
+        const int natom = static_cast<int>(atom_pairs.size());
+#ifdef _OPENMP
+#pragma omp for schedule(guided, 16)
+#endif
+        for (int i = 0; i < natom; i++)
+        {
+            const FAtom& atom = atom_pairs[i];
+            int box_i_x = 0;
+            int box_i_y = 0;
+            int box_i_z = 0;
+            this->getBox(box_i_x, box_i_y, box_i_z, atom.x, atom.y, atom.z);
+
+            if (box_edge_length <= 0.0 || box_nx <= 0 || box_ny <= 0 || box_nz <= 0)
+            {
+                continue;
+            }
+
+            box_i_x = std::max(0, std::min(box_nx - 1, box_i_x));
+            box_i_y = std::max(0, std::min(box_ny - 1, box_i_y));
+            box_i_z = std::max(0, std::min(box_nz - 1, box_i_z));
+
+            const int x_begin = std::max(0, box_i_x - search_span);
+            const int x_end = std::min(box_nx - 1, box_i_x + search_span);
+            const int y_begin = std::max(0, box_i_y - search_span);
+            const int y_end = std::min(box_ny - 1, box_i_y + search_span);
+            const int z_begin = std::max(0, box_i_z - search_span);
+            const int z_end = std::min(box_nz - 1, box_i_z + search_span);
+
+            const int atom_id = flat_atom_id(atom.type, atom.natom);
+            for (int box_i_x_adj = x_begin; box_i_x_adj <= x_end; box_i_x_adj++)
+            {
+                for (int box_i_y_adj = y_begin; box_i_y_adj <= y_end; box_i_y_adj++)
+                {
+                    for (int box_i_z_adj = z_begin; box_i_z_adj <= z_end; box_i_z_adj++)
+                    {
+#ifndef SLTK_DISABLE_ADAPTIVE_BOX_PRUNING
+                        if (!this->box_may_contain_neighbor(atom, this->box_bounds[box_i_x_adj][box_i_y_adj][box_i_z_adj]))
+                        {
+                            continue;
+                        }
+#endif
+                        for (auto& candidate : this->atoms_in_box[box_i_x_adj][box_i_y_adj][box_i_z_adj])
+                        {
+                            if (candidate.type == atom.type && candidate.natom == atom.natom
+                                && candidate.cell_x == 0 && candidate.cell_y == 0 && candidate.cell_z == 0)
+                            {
+                                continue;
+                            }
+
+                            const int candidate_id = flat_atom_id(candidate.type, candidate.natom);
+                            const auto forward_key = std::make_tuple(atom_id,
+                                                                     candidate_id,
+                                                                     candidate.cell_x,
+                                                                     candidate.cell_y,
+                                                                     candidate.cell_z);
+                            const auto reverse_key = std::make_tuple(candidate_id,
+                                                                     atom_id,
+                                                                     -candidate.cell_x,
+                                                                     -candidate.cell_y,
+                                                                     -candidate.cell_z);
+                            if (!(forward_key < reverse_key))
+                            {
+                                continue;
+                            }
+
+                            const double delta_x = atom.x - candidate.x;
+                            const double delta_y = atom.y - candidate.y;
+                            const double delta_z = atom.z - candidate.z;
+                            const double dr = delta_x * delta_x + delta_y * delta_y + delta_z * delta_z;
+                            if (dr == 0.0 || dr > this->sradius2)
+                            {
+                                continue;
+                            }
+
+                            const AtomImageKey mirrored_atom_key(atom.type,
+                                                                 atom.natom,
+                                                                 -candidate.cell_x,
+                                                                 -candidate.cell_y,
+                                                                 -candidate.cell_z);
+                            const auto mirrored_atom = atom_image_lookup.find(mirrored_atom_key);
+                            if (mirrored_atom == atom_image_lookup.end())
+                            {
+                                continue;
+                            }
+
+                            pending.emplace_back(atom.type, atom.natom, &candidate);
+                            pending.emplace_back(candidate.type, candidate.natom, mirrored_atom->second);
+                        }
+                    }
+                }
+            }
+        }
     }
+
+    for (const auto& local_neighbors : thread_neighbors)
+    {
+        for (const auto& neighbor : local_neighbors)
+        {
+            all_adj_info[neighbor.type][neighbor.natom].push_back(neighbor.atom);
+        }
+    }
+
     ModuleBase::timer::end("Grid", "constru_adj");
 }
 
